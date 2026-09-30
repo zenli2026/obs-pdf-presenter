@@ -1,28 +1,35 @@
 /*
- * obs-scene-multiview —— OBS 原生「多视图场景切换」插件
+ * obs-scene-multiview —— OBS 原生「多视图场景切换」插件（Win32 版，不依赖 Qt）
  * 独立的浮动窗口：把当前场景集合里的所有场景按数量动态排成网格，
  * 每个格子显示场景实时缩略图与名称；点一下选中，按「切换」即把该
  * 场景设为主场景（也可双击直接切换）。场景数不限，格子自动排布。
+ *
+ * 缩略图渲染：在 OBS graphics 线程把每个场景渲染到纹理，再读回 CPU
+ * 缓冲，UI 线程用 GDI 画进各格子。
  *
  * 本项目按 GNU GPL v2 协议开源。
  */
 #include <obs-module.h>
 #include <obs-frontend-api/obs-frontend-api.h>
-#include <QApplication>
-#include <QDialog>
-#include <QGridLayout>
-#include <QLabel>
-#include <QPushButton>
-#include <QScrollArea>
-#include <QTimer>
-#include <QMouseEvent>
-#include <QImage>
-#include <QPixmap>
-#include <QHBoxLayout>
-#include <QVBoxLayout>
-#include <mutex>
+#include <windows.h>
+#include <windowsx.h>
+#include <cstdio>
 #include <vector>
+#include <mutex>
 #include <string>
+
+/* UTF-8 -> 宽字符（本文件自用，避免依赖主插件的私有函数） */
+static std::wstring utf8_to_wide(const char *s)
+{
+	if (!s || !*s)
+		return std::wstring();
+	int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
+	if (n <= 0)
+		return std::wstring();
+	std::wstring r((size_t)n, L'\0');
+	MultiByteToWideChar(CP_UTF8, 0, s, -1, &r[0], n);
+	return r;
+}
 
 /* ---------------------- 场景缩略图渲染 ---------------------- */
 
@@ -30,29 +37,44 @@ struct scene_tile {
 	obs_source_t *scene = nullptr;
 	gs_texture_t *tex = nullptr;
 	gs_stagesurface_t *stage = nullptr;
-	unsigned char *buf = nullptr; // texW*texH*4 CPU 缓冲
+	unsigned char *buf = nullptr; // texW*texH*4 RGBA 缓冲
 	int texW = 0;
 	int texH = 0;
-	bool ready = false; // 本次已渲染到 buf
+	bool ready = false; // buf 已有本次渲染结果
+	HWND hwnd = nullptr;
 };
 
-#define THUMB_MAX_H 240 /* 缩略图最大高度像素 */
+#define THUMB_MAX_H 180 /* 缩略图最大高度像素 */
+
+#define IDC_SWITCH 1001
+#define IDC_REFRESH 1002
+#define TIMER_RENDER 1
+
+/* 网格布局参数 */
+#define TILE_W 220
+#define TILE_H 150
+#define GAP 8
+#define TOPBAR_H 34
+#define MARGIN 10
 
 struct multiview_ctx {
-	QDialog *win = nullptr;
-	QScrollArea *scroll = nullptr;
-	QWidget *gridContainer = nullptr;
-	QGridLayout *grid = nullptr;
-	QPushButton *switchBtn = nullptr;
-	QPushButton *refreshBtn = nullptr;
-	QLabel *statusLabel = nullptr;
-	QTimer *timer = nullptr;
+	HWND win = nullptr;
+	HWND statusLabel = nullptr;
+	HWND switchBtn = nullptr;
+	HWND refreshBtn = nullptr;
+	HWND gridHost = nullptr;
 
 	std::mutex mtx;
-	std::vector<scene_tile> tiles; // 与 scenes 一一对应（graphics 线程写 buf）
+	std::vector<scene_tile> tiles;
 	obs_source_t *selected = nullptr;
-	int cols = 4; // 当前网格列数
+	int selectedIndex = -1;
+	int cols = 4;
+	int scrollPos = 0;
+	int rows = 0;
 	bool winOpen = false;
+
+	HFONT font = nullptr;
+	HFONT fontBig = nullptr;
 };
 
 static multiview_ctx *g_ctx = nullptr;
@@ -97,164 +119,6 @@ static void render_all_task(void *param)
 		render_one_tile(t);
 }
 
-/* 更新某格子的 QLabel 缩略图（UI 线程） */
-static void apply_tile_to_label(multiview_ctx *ctx, int index)
-{
-	scene_tile &t = ctx->tiles[index];
-	if (!t.ready || !t.buf)
-		return;
-	QImage img(t.buf, t.texW, t.texH, QImage::Format_RGBA8888);
-	QLabel *lab = ctx->grid->itemAtPosition(index / ctx->cols, index % ctx->cols)
-			      ->widget()
-			      ->findChild<QLabel *>("thumb");
-	if (lab)
-		lab->setPixmap(QPixmap::fromImage(img));
-	t.ready = false;
-}
-
-static void on_timer_tick(void)
-{
-	multiview_ctx *ctx = g_ctx;
-	if (!ctx || !ctx->winOpen)
-		return;
-
-	/* 触发 graphics 线程渲染所有场景 */
-	obs_queue_task(OBS_TASK_GRAPHICS, render_all_task, ctx, false);
-
-	/* 把已就绪的缩略图刷到界面上 */
-	std::lock_guard<std::mutex> lk(ctx->mtx);
-	for (size_t i = 0; i < ctx->tiles.size(); i++) {
-		if (ctx->tiles[i].ready)
-			apply_tile_to_label(ctx, (int)i);
-	}
-}
-
-/* ---------------------- 网格布局 ---------------------- */
-
-static void refresh_scene_list(multiview_ctx *ctx);
-static void release_tiles_task(void *param);
-
-/* 可点击的缩略图格子 */
-class TileWidget : public QWidget {
-	Q_OBJECT
-public:
-	TileWidget(QWidget *parent = nullptr) : QWidget(parent) {}
-	multiview_ctx *ctx = nullptr;
-	obs_source_t *scene = nullptr;
-	QLabel *thumb = nullptr;
-	QLabel *name = nullptr;
-signals:
-	void tileClicked(obs_source_t *scene);
-protected:
-	void mousePressEvent(QMouseEvent *ev) override
-	{
-		Q_EMIT tileClicked(scene);
-		QWidget::mousePressEvent(ev);
-	}
-	void mouseDoubleClickEvent(QMouseEvent *ev) override
-	{
-		if (scene)
-			obs_frontend_set_current_scene(scene);
-		QWidget::mouseDoubleClickEvent(ev);
-	}
-};
-
-/* 重新构建 UI 网格：按场景数量动态分列 */
-static void rebuild_grid(multiview_ctx *ctx)
-{
-	if (!ctx->gridContainer)
-		return;
-	/* 先释放上一批 GPU 资源（graphics 线程，阻塞等待） */
-	obs_queue_task(OBS_TASK_GRAPHICS, release_tiles_task, ctx, true);
-
-	/* 清掉旧格子 */
-	QLayoutItem *item;
-	while ((item = ctx->grid->takeAt(0)) != nullptr) {
-		if (item->widget())
-			item->widget()->deleteLater();
-		delete item;
-	}
-
-	obs_frontend_source_list list = {};
-	obs_frontend_get_scenes(&list);
-	size_t n = list.sources.num;
-	int total = (int)n;
-
-	/* 计算列数：>=8 场景时一行 5 个，4~7 一行 4 个，<=3 一行 3 个 */
-	ctx->cols = (total >= 8) ? 5 : ((total >= 4) ? 4 : 3);
-	if (ctx->cols < 1)
-		ctx->cols = 1;
-
-	/* 重建 tiles 数组（graphics 线程会用它） */
-	{
-		std::lock_guard<std::mutex> lk(ctx->mtx);
-		ctx->tiles.clear();
-		ctx->tiles.resize(total);
-		for (size_t i = 0; i < n; i++) {
-			ctx->tiles[i].scene = obs_source_get_ref(list.sources.array[i]);
-			uint32_t sw = obs_source_get_width(list.sources.array[i]);
-			uint32_t sh = obs_source_get_height(list.sources.array[i]);
-			if (sw == 0 || sh == 0) {
-				sw = 320;
-				sh = 180;
-			}
-			/* 等比缩到高度 <= THUMB_MAX_H */
-			int h = (int)sh, w = (int)sw;
-			if (h > THUMB_MAX_H) {
-				w = (int)((float)w * THUMB_MAX_H / h);
-				h = THUMB_MAX_H;
-			}
-			ctx->tiles[i].texW = w;
-			ctx->tiles[i].texH = h;
-			ctx->tiles[i].buf =
-				(unsigned char *)bmalloc((size_t)w * h * 4);
-		}
-	}
-
-	if (total == 0) {
-		ctx->statusLabel->setText("当前没有场景");
-		return;
-	}
-	ctx->statusLabel->setText(QString("共 %1 个场景").arg(total));
-
-	for (int i = 0; i < total; i++) {
-		TileWidget *tw = new TileWidget(ctx->gridContainer);
-		tw->ctx = ctx;
-		tw->scene = list.sources.array[i];
-
-		QVBoxLayout *vl = new QVBoxLayout(tw);
-		vl->setContentsMargins(2, 2, 2, 2);
-		QLabel *thumb = new QLabel(tw);
-		thumb->setObjectName("thumb");
-		thumb->setAlignment(Qt::AlignCenter);
-		thumb->setMinimumSize(160, 90);
-		thumb->setStyleSheet(
-			"background:#222; border:1px solid #444;");
-		thumb->setText("…");
-		QLabel *nm = new QLabel(
-			QString::fromUtf8(obs_source_get_name(list.sources.array[i])),
-			tw);
-		nm->setAlignment(Qt::AlignCenter);
-		nm->setStyleSheet("color:#eee; font-size:12px;");
-		vl->addWidget(thumb);
-		vl->addWidget(nm);
-
-		tw->thumb = thumb;
-		tw->name = nm;
-
-		int r = i / ctx->cols;
-		int c = i % ctx->cols;
-		ctx->grid->addWidget(tw, r, c);
-		QObject::connect(tw, &TileWidget::tileClicked,
-				 [ctx](obs_source_t *scene) {
-					 ctx->selected = scene;
-					 ctx->switchBtn->setEnabled(scene != nullptr);
-				 });
-	}
-
-	obs_frontend_source_list_free(&list);
-}
-
 /* 创建/更新纹理与 stage（必须在 graphics 线程） */
 static void setup_textures_task(void *param)
 {
@@ -288,71 +152,382 @@ static void release_tiles_task(void *param)
 	ctx->tiles.clear();
 }
 
-static void refresh_scene_list(multiview_ctx *ctx)
+/* ---------------------- GDI 绘制 ---------------------- */
+
+static void tile_paint(multiview_ctx *ctx, HWND hwnd, int index)
 {
-	rebuild_grid(ctx);
-	obs_queue_task(OBS_TASK_GRAPHICS, setup_textures_task, ctx, true);
-	obs_queue_task(OBS_TASK_GRAPHICS, render_all_task, ctx, true);
-	on_timer_tick();
+	scene_tile &t = ctx->tiles[index];
+	PAINTSTRUCT ps;
+	HDC hdc = BeginPaint(hwnd, &ps);
+	RECT rc;
+	GetClientRect(hwnd, &rc);
+
+	/* 背景 */
+	HBRUSH bg = CreateSolidBrush(RGB(40, 40, 40));
+	FillRect(hdc, &rc, bg);
+	DeleteObject(bg);
+
+	/* 缩略图 */
+	{
+		std::lock_guard<std::mutex> lk(ctx->mtx);
+		if (t.ready && t.buf) {
+			BITMAPINFO bmi = {};
+			bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+			bmi.bmiHeader.biWidth = t.texW;
+			bmi.bmiHeader.biHeight = -t.texH; /* top-down */
+			bmi.bmiHeader.biPlanes = 1;
+			bmi.bmiHeader.biBitCount = 32;
+			bmi.bmiHeader.biCompression = BI_BITFIELDS;
+			((DWORD *)&bmi.bmiColors)[0] = 0x00FF0000; /* R */
+			((DWORD *)&bmi.bmiColors)[1] = 0x0000FF00; /* G */
+			((DWORD *)&bmi.bmiColors)[2] = 0x000000FF; /* B */
+			int iw = rc.right - rc.left;
+			int ih = rc.bottom - rc.top;
+			SetStretchBltMode(hdc, HALFTONE);
+			StretchDIBits(hdc, 0, 0, iw, ih - 20, 0, 0, t.texW, t.texH,
+				      t.buf, &bmi, DIB_RGB_COLORS, SRCCOPY);
+		}
+	}
+	/* 场景名 */
+	if (t.scene) {
+		SetTextColor(hdc, RGB(230, 230, 230));
+		SetBkMode(hdc, TRANSPARENT);
+		RECT tr = {0, rc.bottom - 18, rc.right, rc.bottom};
+		HGDIOBJ of = SelectObject(hdc, ctx->font);
+		DrawTextW(hdc, utf8_to_wide(obs_source_get_name(t.scene)).c_str(),
+			  -1, &tr,
+			  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+		SelectObject(hdc, of);
+	}
+
+	/* 选中描边 */
+	if (index == ctx->selectedIndex) {
+		HBRUSH sel = CreateSolidBrush(RGB(38, 160, 218));
+		FrameRect(hdc, &rc, sel);
+		DeleteObject(sel);
+	}
+	EndPaint(hwnd, &ps);
 }
 
-static void on_switch_clicked(void)
+/* ---------------------- 窗口过程 ---------------------- */
+
+static void select_tile(multiview_ctx *ctx, HWND hwnd)
+{
+	int index = (int)GetWindowLongPtrW(hwnd, GWLP_USERDATA) - 1;
+	if (index < 0 || index >= (int)ctx->tiles.size())
+		return;
+	ctx->selected = ctx->tiles[index].scene;
+	ctx->selectedIndex = index;
+	EnableWindow(ctx->switchBtn, TRUE);
+	/* 重画所有格子刷新选中框 */
+	for (size_t i = 0; i < ctx->tiles.size(); i++)
+		if (ctx->tiles[i].hwnd)
+			InvalidateRect(ctx->tiles[i].hwnd, nullptr, TRUE);
+}
+
+static void switch_to_tile(multiview_ctx *ctx, HWND hwnd)
+{
+	int index = (int)GetWindowLongPtrW(hwnd, GWLP_USERDATA) - 1;
+	if (index < 0 || index >= (int)ctx->tiles.size())
+		return;
+	ctx->selected = ctx->tiles[index].scene;
+	ctx->selectedIndex = index;
+	obs_frontend_set_current_scene(ctx->selected);
+	SetWindowTextW(ctx->statusLabel,
+		       (L"已切换到：" +
+			utf8_to_wide(obs_source_get_name(ctx->selected)))
+			       .c_str());
+}
+
+static LRESULT CALLBACK tile_wndproc(HWND hwnd, UINT msg, WPARAM wParam,
+				     LPARAM lParam)
 {
 	multiview_ctx *ctx = g_ctx;
-	if (!ctx || !ctx->selected)
-		return;
-	obs_frontend_set_current_scene(ctx->selected);
-	ctx->statusLabel->setText(
-		QString("已切换到：%1")
-			.arg(QString::fromUtf8(
-				obs_source_get_name(ctx->selected))));
+	switch (msg) {
+	case WM_PAINT: {
+		int index = (int)GetWindowLongPtrW(hwnd, GWLP_USERDATA) - 1;
+		if (ctx && index >= 0 && index < (int)ctx->tiles.size())
+			tile_paint(ctx, hwnd, index);
+		return 0;
+	}
+	case WM_LBUTTONUP:
+		if (ctx)
+			select_tile(ctx, hwnd);
+		return 0;
+	case WM_LBUTTONDBLCLK:
+		if (ctx)
+			switch_to_tile(ctx, hwnd);
+		return 0;
+	case WM_ERASEBKGND:
+		return 1;
+	}
+	return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+/* 布局：根据窗口大小摆放顶部栏与网格区域，并排列格子 */
+static void layout_tiles(multiview_ctx *ctx)
+{
+	if (!ctx->win)
+		return;
+	RECT cr;
+	GetClientRect(ctx->win, &cr);
+	int w = cr.right - cr.left;
+	int h = cr.bottom - cr.top;
+	int top = 4;
+	SetWindowPos(ctx->statusLabel, nullptr, 6, top, w - 260, 24, SWP_NOZORDER);
+	SetWindowPos(ctx->refreshBtn, nullptr, w - 190, top - 3, 80, 26,
+		     SWP_NOZORDER);
+	SetWindowPos(ctx->switchBtn, nullptr, w - 100, top - 3, 90, 26,
+		     SWP_NOZORDER);
+	SetWindowPos(ctx->gridHost, nullptr, 0, TOPBAR_H, w, h - TOPBAR_H,
+		     SWP_NOZORDER);
+
+	size_t n = ctx->tiles.size();
+	int cols = (n >= 8) ? 5 : ((n >= 4) ? 4 : 3);
+	if (cols < 1)
+		cols = 1;
+	ctx->cols = cols;
+	int rows = (int)((n + cols - 1) / cols);
+	ctx->rows = rows;
+
+	/* 可滚动内容高度 */
+	int hostH = (h - TOPBAR_H);
+	int contentH = rows * (TILE_H + GAP) + MARGIN * 2;
+	int maxScroll = contentH - hostH;
+	if (maxScroll < 0)
+		maxScroll = 0;
+	SCROLLINFO si = {};
+	si.cbSize = sizeof(si);
+	si.fMask = SIF_RANGE | SIF_PAGE;
+	si.nMin = 0;
+	si.nMax = contentH;
+	si.nPage = hostH;
+	SetScrollInfo(ctx->gridHost, SB_VERT, &si, TRUE);
+	if (ctx->scrollPos > maxScroll)
+		ctx->scrollPos = maxScroll;
+
+	for (size_t i = 0; i < n; i++) {
+		int r = (int)(i / cols);
+		int c = (int)(i % cols);
+		int x = MARGIN + c * (TILE_W + GAP);
+		int y = MARGIN + r * (TILE_H + GAP) - ctx->scrollPos;
+		if (ctx->tiles[i].hwnd)
+			SetWindowPos(ctx->tiles[i].hwnd, nullptr, x, y, TILE_W,
+				     TILE_H, SWP_NOZORDER);
+	}
+}
+
+/* 重建 tiles 数组 + 格子窗口 + 布局 */
+static void rebuild_grid(multiview_ctx *ctx)
+{
+	if (!ctx->gridHost)
+		return;
+	/* 释放上一批 GPU 资源（graphics 线程） */
+	obs_queue_task(OBS_TASK_GRAPHICS, release_tiles_task, ctx, true);
+
+	/* 销毁旧格子窗口 */
+	for (auto &t : ctx->tiles)
+		if (t.hwnd)
+			DestroyWindow(t.hwnd);
+	ctx->tiles.clear();
+	ctx->selected = nullptr;
+	ctx->selectedIndex = -1;
+	EnableWindow(ctx->switchBtn, FALSE);
+
+	obs_frontend_source_list list = {};
+	obs_frontend_get_scenes(&list);
+	size_t n = list.sources.num;
+	ctx->tiles.resize(n);
+
+	/* 创建格子窗口 */
+	HINSTANCE inst = (HINSTANCE)GetModuleHandleW(nullptr);
+	for (size_t i = 0; i < n; i++) {
+		scene_tile &t = ctx->tiles[i];
+		t.scene = obs_source_get_ref(list.sources.array[i]);
+		uint32_t sw = obs_source_get_width(list.sources.array[i]);
+		uint32_t sh = obs_source_get_height(list.sources.array[i]);
+		if (sw == 0 || sh == 0) {
+			sw = 320;
+			sh = 180;
+		}
+		int h = (int)sh, w = (int)sw;
+		if (h > THUMB_MAX_H) {
+			w = (int)((float)w * THUMB_MAX_H / h);
+			h = THUMB_MAX_H;
+		}
+		t.texW = w;
+		t.texH = h;
+		t.buf = (unsigned char *)bmalloc((size_t)w * h * 4);
+		t.hwnd = CreateWindowExW(0, L"MV_Tile", L"",
+					 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+					 0, 0, TILE_W, TILE_H, ctx->gridHost,
+					 nullptr, inst, nullptr);
+		if (t.hwnd) {
+			SetWindowLongPtrW(t.hwnd, GWLP_USERDATA, (LONG_PTR)(i + 1));
+			SetWindowFont(t.hwnd, ctx->font, TRUE);
+		}
+	}
+
+	if (n == 0) {
+		SetWindowTextW(ctx->statusLabel, L"当前没有场景");
+	} else {
+		wchar_t buf[64];
+		swprintf_s(buf, L"共 %u 个场景（点一下选中，点「切换」切换，双击直接切换）",
+			   (unsigned)n);
+		SetWindowTextW(ctx->statusLabel, buf);
+	}
+
+	obs_frontend_source_list_free(&list);
+
+	/* 创建纹理并渲染一次 */
+	obs_queue_task(OBS_TASK_GRAPHICS, setup_textures_task, ctx, true);
+	obs_queue_task(OBS_TASK_GRAPHICS, render_all_task, ctx, true);
+	layout_tiles(ctx);
+	for (auto &t : ctx->tiles)
+		if (t.hwnd)
+			InvalidateRect(t.hwnd, nullptr, TRUE);
+}
+
+static void on_refresh(multiview_ctx *ctx)
+{
+	rebuild_grid(ctx);
+}
+
+static void on_switch(multiview_ctx *ctx)
+{
+	if (!ctx->selected)
+		return;
+	obs_frontend_set_current_scene(ctx->selected);
+	SetWindowTextW(ctx->statusLabel,
+		       (L"已切换到：" +
+			utf8_to_wide(obs_source_get_name(ctx->selected)))
+			       .c_str());
+}
+
+static void close_window(multiview_ctx *ctx);
+
+static LRESULT CALLBACK main_wndproc(HWND hwnd, UINT msg, WPARAM wParam,
+				     LPARAM lParam)
+{
+	multiview_ctx *ctx = g_ctx;
+	switch (msg) {
+	case WM_COMMAND:
+		if (LOWORD(wParam) == IDC_SWITCH && ctx)
+			on_switch(ctx);
+		else if (LOWORD(wParam) == IDC_REFRESH && ctx)
+			on_refresh(ctx);
+		return 0;
+	case WM_SIZE:
+		if (ctx)
+			layout_tiles(ctx);
+		return 0;
+	case WM_VSCROLL: {
+		if (!ctx)
+			break;
+		SCROLLINFO si = {};
+		si.cbSize = sizeof(si);
+		si.fMask = SIF_ALL;
+		GetScrollInfo(ctx->gridHost, SB_VERT, &si);
+		int newPos = si.nPos;
+		switch (LOWORD(wParam)) {
+		case SB_LINEUP:
+			newPos -= 12;
+			break;
+		case SB_LINEDOWN:
+			newPos += 12;
+			break;
+		case SB_PAGEUP:
+			newPos -= si.nPage;
+			break;
+		case SB_PAGEDOWN:
+			newPos += si.nPage;
+			break;
+		case SB_THUMBTRACK:
+		case SB_THUMBPOSITION:
+			newPos = HIWORD(wParam);
+			break;
+		}
+		if (newPos < si.nMin)
+			newPos = si.nMin;
+		if (newPos > si.nMax - (int)si.nPage)
+			newPos = si.nMax - (int)si.nPage;
+		ctx->scrollPos = newPos;
+		SetScrollPos(ctx->gridHost, SB_VERT, newPos, TRUE);
+		layout_tiles(ctx);
+		InvalidateRect(ctx->gridHost, nullptr, TRUE);
+		return 0;
+	}
+	case WM_TIMER:
+		if (ctx && wParam == TIMER_RENDER) {
+			obs_queue_task(OBS_TASK_GRAPHICS, render_all_task, ctx,
+				       false);
+			for (auto &t : ctx->tiles)
+				if (t.hwnd)
+					InvalidateRect(t.hwnd, nullptr, TRUE);
+		}
+		return 0;
+	case WM_CLOSE:
+		if (ctx)
+			close_window(ctx); /* 先释放资源 */
+		DestroyWindow(hwnd);
+		return 0;
+	case WM_DESTROY:
+		if (ctx)
+			ctx->win = nullptr; /* 窗口已销毁 */
+		return 0;
+	}
+	return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+/* 打开/创建窗口 */
 static void open_window(multiview_ctx *ctx)
 {
 	if (ctx->winOpen)
 		return;
 	ctx->winOpen = true;
 
-	ctx->win = new QDialog();
-	ctx->win->setWindowTitle("多视图场景切换");
-	ctx->win->resize(1000, 640);
+	HINSTANCE inst = (HINSTANCE)GetModuleHandleW(nullptr);
+	ctx->font = CreateFontW(-15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+				OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+				CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+	ctx->fontBig =
+		CreateFontW(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+			    OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+			    CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
 
-	QVBoxLayout *main = new QVBoxLayout(ctx->win);
+	ctx->win = CreateWindowExW(0, L"MV_Window", L"多视图场景切换",
+				   WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+				   CW_USEDEFAULT, CW_USEDEFAULT, 1160, 700,
+				   nullptr, nullptr, inst, nullptr);
+	if (!ctx->win) {
+		ctx->winOpen = false;
+		return;
+	}
 
-	/* 顶部：状态 + 操作按钮 */
-	QHBoxLayout *top = new QHBoxLayout();
-	ctx->statusLabel = new QLabel(ctx->win);
-	ctx->statusLabel->setStyleSheet("color:#ccc;");
-	ctx->switchBtn = new QPushButton("切换", ctx->win);
-	ctx->switchBtn->setEnabled(false);
-	ctx->refreshBtn = new QPushButton("刷新", ctx->win);
-	top->addWidget(ctx->statusLabel);
-	top->addStretch();
-	top->addWidget(ctx->refreshBtn);
-	top->addWidget(ctx->switchBtn);
-	main->addLayout(top);
+	ctx->statusLabel =
+		CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 6, 6,
+				600, 24, ctx->win, nullptr, inst, nullptr);
+	ctx->refreshBtn = CreateWindowExW(0, L"BUTTON", L"刷新",
+					  WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+					  0, 0, 80, 26, ctx->win,
+					  (HMENU)IDC_REFRESH, inst, nullptr);
+	ctx->switchBtn = CreateWindowExW(0, L"BUTTON", L"切换",
+					 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+					 0, 0, 90, 26, ctx->win,
+					 (HMENU)IDC_SWITCH, inst, nullptr);
+	ctx->gridHost = CreateWindowExW(WS_EX_CLIENTEDGE, L"MV_Grid", L"",
+					WS_CHILD | WS_VISIBLE | WS_VSCROLL, 0,
+					TOPBAR_H, 1160, 660, ctx->win, nullptr,
+					inst, nullptr);
 
-	/* 中间：可滚动网格 */
-	ctx->scroll = new QScrollArea(ctx->win);
-	ctx->gridContainer = new QWidget();
-	ctx->grid = new QGridLayout(ctx->gridContainer);
-	ctx->grid->setSpacing(6);
-	ctx->scroll->setWidget(ctx->gridContainer);
-	ctx->scroll->setWidgetResizable(true);
-	main->addWidget(ctx->scroll);
+	SetWindowFont(ctx->statusLabel, ctx->font, TRUE);
+	SetWindowFont(ctx->refreshBtn, ctx->font, TRUE);
+	SetWindowFont(ctx->switchBtn, ctx->font, TRUE);
 
-	QObject::connect(ctx->switchBtn, &QPushButton::clicked, on_switch_clicked);
-	QObject::connect(ctx->refreshBtn, &QPushButton::clicked,
-			 [ctx]() { refresh_scene_list(ctx); });
+	rebuild_grid(ctx);
+	SetTimer(ctx->win, TIMER_RENDER, 300, nullptr);
 
-	refresh_scene_list(ctx);
-
-	ctx->timer = new QTimer(ctx->win);
-	QObject::connect(ctx->timer, &QTimer::timeout, on_timer_tick);
-	ctx->timer->start(300);
-
-	ctx->win->show();
+	ShowWindow(ctx->win, SW_SHOW);
 }
 
 static void close_window(multiview_ctx *ctx)
@@ -360,20 +535,25 @@ static void close_window(multiview_ctx *ctx)
 	if (!ctx->winOpen)
 		return;
 	ctx->winOpen = false;
-	if (ctx->timer) {
-		ctx->timer->stop();
-		ctx->timer->deleteLater();
-		ctx->timer = nullptr;
-	}
-	/* 释放纹理（graphics 线程）与缓冲 */
+	if (ctx->win)
+		KillTimer(ctx->win, TIMER_RENDER);
 	obs_queue_task(OBS_TASK_GRAPHICS, release_tiles_task, ctx, true);
-	if (ctx->selected)
-		ctx->selected = nullptr;
-	if (ctx->win) {
-		ctx->win->close();
-		ctx->win->deleteLater();
-		ctx->win = nullptr;
-	}
+	for (auto &t : ctx->tiles)
+		if (t.hwnd)
+			DestroyWindow(t.hwnd);
+	ctx->tiles.clear();
+	if (ctx->font)
+		DeleteObject(ctx->font);
+	if (ctx->fontBig)
+		DeleteObject(ctx->fontBig);
+	ctx->font = nullptr;
+	ctx->fontBig = nullptr;
+	ctx->selected = nullptr;
+	ctx->selectedIndex = -1;
+	ctx->statusLabel = nullptr;
+	ctx->switchBtn = nullptr;
+	ctx->refreshBtn = nullptr;
+	ctx->gridHost = nullptr;
 }
 
 /* ---------------------- 插件入口（由主插件调用） ---------------------- */
@@ -386,6 +566,34 @@ static void open_multiview(void *data)
 
 bool multiview_module_load(void)
 {
+	HINSTANCE inst = (HINSTANCE)GetModuleHandleW(nullptr);
+	WNDCLASSEXW tmp = {};
+	tmp.cbSize = sizeof(tmp);
+	if (!GetClassInfoExW(inst, L"MV_Window", &tmp)) {
+		WNDCLASSW wc = {};
+		wc.lpfnWndProc = main_wndproc;
+		wc.hInstance = inst;
+		wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
+		wc.lpszClassName = L"MV_Window";
+		RegisterClassW(&wc);
+	}
+	if (!GetClassInfoExW(inst, L"MV_Tile", &tmp)) {
+		WNDCLASSW wt = {};
+		wt.lpfnWndProc = tile_wndproc;
+		wt.hInstance = inst;
+		wt.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_HAND);
+		wt.lpszClassName = L"MV_Tile";
+		RegisterClassW(&wt);
+	}
+	if (!GetClassInfoExW(inst, L"MV_Grid", &tmp)) {
+		WNDCLASSW wg = {};
+		wg.lpfnWndProc = DefWindowProcW;
+		wg.hInstance = inst;
+		wg.hbrBackground = (HBRUSH)GetStockObject(COLOR_BTNFACE);
+		wg.lpszClassName = L"MV_Grid";
+		RegisterClassW(&wg);
+	}
+
 	g_ctx = new multiview_ctx();
 	obs_frontend_add_tools_menu_item("多视图场景切换（动态网格）", open_multiview,
 					 g_ctx);
@@ -396,10 +604,12 @@ void multiview_module_unload(void)
 {
 	if (g_ctx) {
 		close_window(g_ctx);
+		if (g_ctx->win)
+			DestroyWindow(g_ctx->win);
 		delete g_ctx;
 		g_ctx = nullptr;
 	}
+	UnregisterClassW(L"MV_Window", (HINSTANCE)GetModuleHandleW(nullptr));
+	UnregisterClassW(L"MV_Tile", (HINSTANCE)GetModuleHandleW(nullptr));
+	UnregisterClassW(L"MV_Grid", (HINSTANCE)GetModuleHandleW(nullptr));
 }
-
-/* 让 moc 能处理 Q_OBJECT 子类（本文件内联启用） */
-#include "obs-scene-multiview.moc"
