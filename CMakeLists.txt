@@ -40,6 +40,3 @@ endif()
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/obs-pdf-presenter.cpp)
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
-
-# PPT → PDF 转换脚本随插件一起装到 bin/64bit（运行时与 pdfium.dll 同目录定位）
-install(FILES res/ppt2pdf.ps1 DESTINATION "${CMAKE_PROJECT_NAME}/bin/64bit")
