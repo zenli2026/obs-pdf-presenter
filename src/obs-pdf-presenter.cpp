@@ -729,6 +729,10 @@ static void destroy(void *data)
 static struct obs_source_info source_info = {};
 static bool registered = false;
 
+/* 多视图场景切换窗口（obs-scene-multiview.cpp） */
+bool multiview_module_load(void);
+void multiview_module_unload(void);
+
 bool obs_module_load(void)
 {
 	/* 定位插件目录，供 pdfium.dll 使用 */
@@ -768,12 +772,14 @@ bool obs_module_load(void)
 
 	obs_register_source(&source_info);
 	registered = true;
+	multiview_module_load();
 	blog(LOG_INFO, "[pdf-presenter] 演示文稿播放器插件已加载 (v%s)", PLUGIN_VERSION);
 	return true;
 }
 
 void obs_module_unload(void)
 {
+	multiview_module_unload();
 	if (registered && pdfium_ok())
 		pFPDF_DestroyLibrary();
 	registered = false;
