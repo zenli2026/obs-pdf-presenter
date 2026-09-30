@@ -36,7 +36,7 @@ static std::wstring utf8_to_wide(const char *s)
 struct scene_tile {
 	obs_source_t *scene = nullptr;
 	gs_texture_t *tex = nullptr;
-	gs_stagesurface_t *stage = nullptr;
+	gs_stagesurf_t *stage = nullptr;
 	unsigned char *buf = nullptr; // texW*texH*4 RGBA 缓冲
 	int texW = 0;
 	int texH = 0;
@@ -94,7 +94,7 @@ static void render_one_tile(scene_tile &t)
 	gs_flush();
 
 	if (t.stage) {
-		gs_copy_texture_to_stagesurface(t.stage, t.tex);
+		gs_stage_texture(t.stage, t.tex);
 		unsigned char *ptr = nullptr;
 		uint32_t linesize = 0;
 		if (gs_stagesurface_map(t.stage, &ptr, &linesize)) {
@@ -129,8 +129,8 @@ static void setup_textures_task(void *param)
 			continue;
 		t.tex = gs_texture_create((uint32_t)t.texW, (uint32_t)t.texH,
 					 GS_RGBA, 1, nullptr, GS_RENDER_TARGET);
-		t.stage = gs_stagesurface_create((uint32_t)t.texW,
-						 (uint32_t)t.texH, GS_RGBA, 1);
+		t.stage = gs_stagesurface_create((uint32_t)t.texW, (uint32_t)t.texH,
+						 GS_RGBA);
 	}
 }
 
