@@ -10,7 +10,7 @@
  * 本项目按 GNU GPL v2 协议开源。
  */
 #include <obs-module.h>
-#include <obs-frontend-api/obs-frontend-api.h>
+#include <obs-frontend-api.h>
 #include <windows.h>
 #include <windowsx.h>
 #include <cstdio>
