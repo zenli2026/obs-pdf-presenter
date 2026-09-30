@@ -213,6 +213,19 @@ static std::string convert_ppt_to_pdf(const std::string &src)
 #define CANVAS_W 1920
 #define CANVAS_H 1080
 
+struct pdf_source;
+
+/* 悬浮控制窗（独立线程、始终置顶）：显示页数 + 上一页/下一页按钮 */
+struct ctrl_window {
+	HWND hwnd = nullptr;
+	HWND label = nullptr;
+	std::thread thd;
+	pdf_source *src = nullptr;
+	bool active = false;
+	int page = 0;
+	int total = 0;
+};
+
 struct pdf_source {
 	obs_source_t *source;
 	obs_data_t *settings;
@@ -228,6 +241,8 @@ struct pdf_source {
 	int canvasW = CANVAS_W, canvasH = CANVAS_H; // 画布实际尺寸（随 PDF 页面比例）
 	std::vector<uint8_t> canvas;         // canvasW x canvasH BGRA
 	bool canvasDirty = false;            // 画布已更新，等待渲染线程上传纹理
+
+	ctrl_window *cw = nullptr;           // 悬浮控制窗（可空）
 
 	bool autoplay = false;
 	int interval = 5;
@@ -299,6 +314,12 @@ static void render_page(struct pdf_source *s, int page)
 
 	/* 只更新 CPU 画布，纹理在 video_render（渲染线程）里上传 */
 	s->canvasDirty = true;
+
+	/* 若控制窗打开，刷新页数显示 */
+	if (s->cw && s->cw->hwnd)
+		PostMessageW(s->cw->hwnd, WM_CTRL_REFRESH,
+			     (WPARAM)(intptr_t)page,
+			     (LPARAM)(intptr_t)s->pageCount);
 
 	blog(LOG_INFO, "[pdf-presenter] 已渲染第 %d/%d 页 (%.1fx%.1f -> %dx%d)", page,
 	     s->pageCount, pw, ph, dw, dh);
@@ -384,6 +405,170 @@ static bool prev_btn(obs_properties_t *props, obs_property_t *prop, void *data)
 	UNUSED_PARAMETER(prop);
 	advance((struct pdf_source *)data, -1);
 	return false; // 保持属性窗口打开，方便连点
+}
+
+/* ============================= 悬浮控制窗 ============================= */
+#define WM_CTRL_REFRESH (WM_USER + 10)
+#define ID_CTRL_PREV 1001
+#define ID_CTRL_NEXT 1002
+#define ID_CTRL_CLOSE 1003
+
+struct advance_job {
+	struct pdf_source *s;
+	int delta;
+};
+static void advance_job_run(void *param)
+{
+	struct advance_job *j = (struct advance_job *)param;
+	advance(j->s, j->delta);
+	delete j;
+}
+/* 从控制窗线程安全地把翻页调度到 OBS UI 线程 */
+static void advance_on_ui(struct pdf_source *s, int delta)
+{
+	struct advance_job *j = new struct advance_job{s, delta};
+	obs_queue_task(OBS_TASK_UI, advance_job_run, j);
+}
+
+static LRESULT CALLBACK ctrl_wndproc(HWND hwnd, UINT msg, WPARAM wParam,
+				     LPARAM lParam)
+{
+	struct ctrl_window *cw =
+		(struct ctrl_window *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+	switch (msg) {
+	case WM_COMMAND:
+		switch (LOWORD(wParam)) {
+		case ID_CTRL_PREV:
+			if (cw)
+				advance_on_ui(cw->src, -1);
+			return 0;
+		case ID_CTRL_NEXT:
+			if (cw)
+				advance_on_ui(cw->src, 1);
+			return 0;
+		case ID_CTRL_CLOSE:
+			if (cw)
+				cw->active = false;
+			PostMessageW(hwnd, WM_CLOSE, 0, 0);
+			return 0;
+		}
+		break;
+	case WM_CTRL_REFRESH:
+		if (cw) {
+			cw->page = (int)(intptr_t)wParam;
+			cw->total = (int)(intptr_t)lParam;
+			wchar_t buf[64];
+			swprintf(buf, 64, L"%d / %d 页", cw->page, cw->total);
+			if (cw->label)
+				SetWindowTextW(cw->label, buf);
+		}
+		return 0;
+	case WM_DESTROY:
+		PostQuitMessage(0);
+		return 0;
+	}
+	return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void ctrl_window_run(struct pdf_source *s)
+{
+	struct ctrl_window *cw = s->cw;
+	if (!cw)
+		return;
+	HINSTANCE inst = GetModuleHandleW(nullptr);
+	const wchar_t *cls = L"ObsPdfPresenterCtrlWnd";
+	WNDCLASSEXW wc = {};
+	wc.cbSize = sizeof(wc);
+	wc.lpfnWndProc = ctrl_wndproc;
+	wc.hInstance = inst;
+	wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+	wc.lpszClassName = cls;
+	RegisterClassExW(&wc);
+
+	std::wstring title = L"演示文稿控制 - ";
+	const char *nm = obs_source_get_name(s->source);
+	title += utf8_to_wide(nm ? nm : "");
+
+	DWORD exstyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW;
+	HWND hwnd = CreateWindowExW(exstyle, cls, title.c_str(),
+				    WS_POPUP | WS_VISIBLE, 120, 120, 214, 36,
+				    nullptr, nullptr, inst, nullptr);
+	if (!hwnd)
+		return;
+	SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cw);
+	cw->hwnd = hwnd;
+
+	HFONT font = CreateFontW(-16, 0, 0, 0, FW_BOLD, 0, 0, 0,
+				 DEFAULT_CHARSET, 0, 0, 0, 0, L"Microsoft YaHei UI");
+	HWND prev = CreateWindowExW(0, L"BUTTON", L"◀",
+				    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 2, 2,
+				    44, 32, hwnd, (HMENU)ID_CTRL_PREV, inst,
+				    nullptr);
+	HWND label = CreateWindowExW(0, L"STATIC", L"0 / 0 页",
+				     WS_CHILD | WS_VISIBLE | SS_CENTER |
+					     SS_CENTERIMAGE,
+				     48, 2, 88, 32, hwnd, nullptr, inst,
+				     nullptr);
+	HWND next = CreateWindowExW(0, L"BUTTON", L"▶",
+				    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 138,
+				    2, 44, 32, hwnd, (HMENU)ID_CTRL_NEXT, inst,
+				    nullptr);
+	HWND close = CreateWindowExW(0, L"BUTTON", L"✕",
+				     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 184,
+				     2, 28, 32, hwnd, (HMENU)ID_CTRL_CLOSE,
+				     inst, nullptr);
+	SendMessageW(prev, WM_SETFONT, (WPARAM)font, TRUE);
+	SendMessageW(label, WM_SETFONT, (WPARAM)font, TRUE);
+	SendMessageW(next, WM_SETFONT, (WPARAM)font, TRUE);
+	SendMessageW(close, WM_SETFONT, (WPARAM)font, TRUE);
+	cw->label = label;
+
+	PostMessageW(hwnd, WM_CTRL_REFRESH, (WPARAM)(intptr_t)s->curPage,
+		     (LPARAM)(intptr_t)s->pageCount);
+
+	MSG msg;
+	while (GetMessageW(&msg, nullptr, 0, 0)) {
+		TranslateMessage(&msg);
+		DispatchMessageW(&msg);
+	}
+	cw->hwnd = nullptr;
+}
+
+static void open_ctrl_window(struct pdf_source *s)
+{
+	if (s->cw || s->pageCount <= 0)
+		return;
+	struct ctrl_window *cw = new struct ctrl_window();
+	cw->active = true;
+	cw->src = s;
+	s->cw = cw;
+	cw->thd = std::thread([s]() { ctrl_window_run(s); });
+}
+
+static void close_ctrl_window(struct pdf_source *s)
+{
+	struct ctrl_window *cw = s->cw;
+	if (!cw)
+		return;
+	cw->active = false;
+	if (cw->hwnd)
+		PostMessageW(cw->hwnd, WM_CLOSE, 0, 0);
+	if (cw->thd.joinable())
+		cw->thd.join();
+	s->cw = nullptr;
+	delete cw;
+}
+
+static bool ctrl_btn(obs_properties_t *props, obs_property_t *prop, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(prop);
+	struct pdf_source *s = (struct pdf_source *)data;
+	if (s->cw)
+		close_ctrl_window(s);
+	else
+		open_ctrl_window(s);
+	return true; // 刷新属性，更新按钮文字
 }
 
 static bool next_btn(obs_properties_t *props, obs_property_t *prop, void *data)
@@ -483,6 +668,11 @@ static obs_properties_t *get_properties(void *data)
 	obs_properties_add_int(props, "page", obs_module_text("Page"), 1, 100000, 1);
 	obs_properties_add_button(props, "prev", obs_module_text("Prev"), prev_btn);
 	obs_properties_add_button(props, "next", obs_module_text("Next"), next_btn);
+	obs_properties_add_button(
+		props, "ctrl",
+		(s->cw ? obs_module_text("CloseControl")
+			: obs_module_text("OpenControl")),
+		ctrl_btn);
 	obs_properties_add_bool(props, "autoplay", obs_module_text("Autoplay"));
 	obs_properties_add_int(props, "interval", obs_module_text("Interval"), 1,
 				3600, 1);
@@ -519,6 +709,8 @@ static void destroy(void *data)
 	struct pdf_source *s = (struct pdf_source *)data;
 	if (!s)
 		return;
+	if (s->cw)
+		close_ctrl_window(s);
 	if (s->doc)
 		pFPDF_CloseDocument(s->doc);
 	if (s->tex)
