@@ -578,6 +578,58 @@ static bool ctrl_btn(obs_properties_t *props, obs_property_t *prop, void *data)
 	return true; // 刷新属性，更新按钮文字
 }
 
+/* ============ OBS「可控制媒体源」接口：让画布上出现原生播放控制条 ============ */
+static void media_play_pause(void *data, bool pause)
+{
+	struct pdf_source *s = (struct pdf_source *)data;
+	s->autoplay = !pause;
+	obs_data_set_bool(s->settings, "autoplay", !pause);
+	obs_source_update(s->source, s->settings);
+}
+
+static void media_restart(void *data)
+{
+	struct pdf_source *s = (struct pdf_source *)data;
+	obs_data_set_int(s->settings, "page", 1);
+	obs_source_update(s->source, s->settings);
+}
+
+static void media_stop(void *data)
+{
+	struct pdf_source *s = (struct pdf_source *)data;
+	s->autoplay = false;
+	obs_data_set_bool(s->settings, "autoplay", false);
+	obs_source_update(s->source, s->settings);
+}
+
+static void media_next(void *data)
+{
+	advance((struct pdf_source *)data, 1);
+}
+
+static void media_previous(void *data)
+{
+	advance((struct pdf_source *)data, -1);
+}
+
+static int64_t media_get_duration(void *data)
+{
+	UNUSED_PARAMETER(data);
+	return 0; // 与原生图像幻灯片一致：不提供时长，控制条显示“- / -”
+}
+
+static int64_t media_get_time(void *data)
+{
+	UNUSED_PARAMETER(data);
+	return 0;
+}
+
+static enum obs_media_state media_get_state(void *data)
+{
+	struct pdf_source *s = (struct pdf_source *)data;
+	return s->autoplay ? OBS_MEDIA_STATE_PLAYING : OBS_MEDIA_STATE_PAUSED;
+}
+
 static bool next_btn(obs_properties_t *props, obs_property_t *prop, void *data)
 {
 	UNUSED_PARAMETER(props);
@@ -746,7 +798,7 @@ bool obs_module_load(void)
 
 	source_info.id = "obs_pdf_presenter_source";
 	source_info.type = OBS_SOURCE_TYPE_INPUT;
-	source_info.output_flags = OBS_SOURCE_VIDEO;
+	source_info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CONTROLLABLE_MEDIA;
 	source_info.get_name = get_name;
 	source_info.create = create;
 	source_info.destroy = destroy;
@@ -757,6 +809,15 @@ bool obs_module_load(void)
 	source_info.update = update;
 	source_info.video_render = video_render;
 	source_info.video_tick = video_tick;
+
+	source_info.media_play_pause = media_play_pause;
+	source_info.media_restart = media_restart;
+	source_info.media_stop = media_stop;
+	source_info.media_next = media_next;
+	source_info.media_previous = media_previous;
+	source_info.media_get_duration = media_get_duration;
+	source_info.media_get_time = media_get_time;
+	source_info.media_get_state = media_get_state;
 
 	obs_register_source(&source_info);
 	registered = true;
