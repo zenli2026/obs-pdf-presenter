@@ -14,6 +14,8 @@
 
 #include <windows.h>
 #include <shellapi.h>
+#include <objbase.h>
+#include <oleauto.h>
 #include <string>
 #include <vector>
 #include <thread>
@@ -163,6 +165,58 @@ static bool file_exists(const std::wstring &path)
 	return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
 }
 
+/* ---- PowerPoint COM 自动化辅助 ---- */
+static HRESULT get_dispid(IDispatch *p, const wchar_t *name, DISPID *id)
+{
+	if (!p)
+		return E_POINTER;
+	wchar_t *names[1] = {(wchar_t *)name};
+	DISPID d = 0;
+	HRESULT hr = p->GetIDsOfNames(IID_NULL, names, 1, LOCALE_USER_DEFAULT, &d);
+	if (id)
+		*id = d;
+	return hr;
+}
+
+static HRESULT com_get_prop(IDispatch *p, const wchar_t *name, VARIANT *res)
+{
+	DISPID id;
+	HRESULT hr = get_dispid(p, name, &id);
+	if (FAILED(hr))
+		return hr;
+	DISPPARAMS dp = {};
+	return p->Invoke(id, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_PROPERTYGET, &dp,
+			 res, nullptr, nullptr);
+}
+
+static HRESULT com_call(IDispatch *p, const wchar_t *name, VARIANT *args,
+			int argc, VARIANT *res)
+{
+	DISPID id;
+	HRESULT hr = get_dispid(p, name, &id);
+	if (FAILED(hr))
+		return hr;
+	if (argc > 0) { // Invoke 要求参数倒序
+		for (int i = 0, j = argc - 1; i < j; i++, j--) {
+			VARIANT t = args[i];
+			args[i] = args[j];
+			args[j] = t;
+		}
+	}
+	DISPPARAMS dp = {};
+	dp.cArgs = (UINT)argc;
+	dp.rgvarg = args;
+	VARIANT tmp;
+	VariantInit(&tmp);
+	VARIANT *out = res ? res : &tmp;
+	hr = p->Invoke(id, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_METHOD, &dp, out,
+		       nullptr, nullptr);
+	if (!res)
+		VariantClear(&tmp);
+	return hr;
+}
+
+/* 直接用本机 PowerPoint(COM) 把 PPT/PPTX 转成 PDF；返回生成的 pdf 路径；失败返回空 */
 static std::string convert_ppt_to_pdf(const std::string &src)
 {
 	std::wstring srcW = utf8_to_wide(src);
@@ -185,40 +239,88 @@ static std::string convert_ppt_to_pdf(const std::string &src)
 	if (file_exists(outW))
 		DeleteFileW(outW.c_str());
 
-	std::wstring ps1 = utf8_to_wide(g_module_dir) + L"\\ppt2pdf.ps1";
-	if (!file_exists(ps1)) {
-		blog(LOG_WARNING, "[pdf-presenter] 未找到 ppt2pdf.ps1，无法转换 PPT");
-		return "";
-	}
+	bool coInit = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
+	IDispatch *pp = nullptr;
+	bool ok = false;
+	do {
+		CLSID clsid;
+		if (FAILED(CLSIDFromProgID(L"PowerPoint.Application", &clsid)))
+			break;
+		if (FAILED(CoCreateInstance(clsid, nullptr, CLSCTX_LOCAL_SERVER,
+					    IID_IDispatch, (void **)&pp)))
+			break;
 
-	std::wstring cmd = L"\"powershell\" -NoProfile -ExecutionPolicy Bypass -File \""
-			   + ps1 + L"\" -InputPath \"" + srcW + L"\" -OutputPath \""
-			   + outW + L"\"";
-	blog(LOG_INFO, "[pdf-presenter] 转换 PPT -> PDF: %ls", cmd.c_str());
+		VARIANT vPresents;
+		VariantInit(&vPresents);
+		if (FAILED(com_get_prop(pp, L"Presentations", &vPresents)))
+			break;
+		if (vPresents.vt != VT_DISPATCH || !vPresents.pdispVal) {
+			VariantClear(&vPresents);
+			break;
+		}
+		IDispatch *presents = vPresents.pdispVal;
 
-	/* 用隐藏窗口启动（不用 CREATE_NO_WINDOW：无窗口上下文里 PowerPoint
-	   COM 可能起不来，实测隐藏窗口方式转换稳定成功） */
-	STARTUPINFOW si = {};
-	si.cb = sizeof(si);
-	si.dwFlags = STARTF_USESHOWWINDOW;
-	si.wShowWindow = SW_HIDE;
-	PROCESS_INFORMATION pi = {};
-	if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, 0, nullptr,
-			    nullptr, &si, &pi)) {
-		blog(LOG_WARNING, "[pdf-presenter] 启动 powershell 失败: %lu",
-		     GetLastError());
-		return "";
-	}
-	WaitForSingleObject(pi.hProcess, INFINITE);
-	DWORD code = 0;
-	GetExitCodeProcess(pi.hProcess, &code);
-	CloseHandle(pi.hThread);
-	CloseHandle(pi.hProcess);
-	if (code != 0 || !file_exists(outW)) {
-		blog(LOG_WARNING, "[pdf-presenter] PPT 转换失败，退出码 %lu", code);
-		return "";
-	}
-	return wide_to_utf8(outW);
+		/* Presentations.Open(FileName, ReadOnly=true, Untitled=false, WithWindow=true) */
+		VARIANT args[4];
+		for (int i = 0; i < 4; i++)
+			VariantInit(&args[i]);
+		args[0].vt = VT_BSTR;
+		args[0].bstrVal = SysAllocString(srcW.c_str());
+		args[1].vt = VT_BOOL;
+		args[1].boolVal = VARIANT_TRUE;
+		args[2].vt = VT_BOOL;
+		args[2].boolVal = VARIANT_FALSE;
+		args[3].vt = VT_BOOL;
+		args[3].boolVal = VARIANT_TRUE;
+		VARIANT vPres;
+		VariantInit(&vPres);
+		if (FAILED(com_call(presents, L"Open", args, 4, &vPres)) ||
+		    vPres.vt != VT_DISPATCH || !vPres.pdispVal) {
+			VariantClear(&vPresents);
+			break;
+		}
+		VariantClear(&vPresents); // 释放 Presentations 引用
+		IDispatch *pres = vPres.pdispVal;
+
+		/* Presentation.SaveAs(OutputPath, ppSaveAsPDF=32) */
+		VARIANT sa[2];
+		VariantInit(&sa[0]);
+		VariantInit(&sa[1]);
+		sa[0].vt = VT_BSTR;
+		sa[0].bstrVal = SysAllocString(outW.c_str());
+		sa[1].vt = VT_I4;
+		sa[1].lVal = 32;
+		VARIANT saRet;
+		VariantInit(&saRet);
+		ok = SUCCEEDED(com_call(pres, L"SaveAs", sa, 2, &saRet));
+		VariantClear(&saRet);
+		VariantClear(&sa[0]);
+		VariantClear(&sa[1]);
+
+		/* Presentation.Close() */
+		VARIANT cRet;
+		VariantInit(&cRet);
+		com_call(pres, L"Close", nullptr, 0, &cRet);
+		VariantClear(&cRet);
+		pres->Release();
+		VariantClear(&vPres);
+
+		/* PowerPoint.Quit() */
+		VARIANT qRet;
+		VariantInit(&qRet);
+		com_call(pp, L"Quit", nullptr, 0, &qRet);
+		VariantClear(&qRet);
+		pp->Release();
+		pp = nullptr;
+	} while (0);
+
+	if (coInit)
+		CoUninitialize();
+	if (!ok)
+		blog(LOG_WARNING, "[pdf-presenter] PPT 转 PDF 失败 (COM)");
+	if (ok && file_exists(outW))
+		return wide_to_utf8(outW);
+	return "";
 }
 
 /* ============================= 源结构 ============================= */
