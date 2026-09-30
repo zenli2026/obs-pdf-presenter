@@ -196,11 +196,15 @@ static std::string convert_ppt_to_pdf(const std::string &src)
 			   + outW + L"\"";
 	blog(LOG_INFO, "[pdf-presenter] 转换 PPT -> PDF: %ls", cmd.c_str());
 
+	/* 用隐藏窗口启动（不用 CREATE_NO_WINDOW：无窗口上下文里 PowerPoint
+	   COM 可能起不来，实测隐藏窗口方式转换稳定成功） */
 	STARTUPINFOW si = {};
 	si.cb = sizeof(si);
+	si.dwFlags = STARTF_USESHOWWINDOW;
+	si.wShowWindow = SW_HIDE;
 	PROCESS_INFORMATION pi = {};
-	if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE,
-			    CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+	if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, 0, nullptr,
+			    nullptr, &si, &pi)) {
 		blog(LOG_WARNING, "[pdf-presenter] 启动 powershell 失败: %lu",
 		     GetLastError());
 		return "";
