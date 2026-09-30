@@ -1,35 +1,42 @@
-cmake_minimum_required(VERSION 3.20)
-project(obs-pdf-presenter VERSION 1.0.0 LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.28...3.30)
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCOPE)
 
-if(NOT CMAKE_GENERATOR MATCHES "Visual Studio")
-  if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING "" FORCE)
-  endif()
-endif()
+project(${_name} VERSION ${_version})
 
-# 需要 OBS 提供的 libobs 包（find_package 会搜索 libobs_DIR / CMAKE_PREFIX_PATH）
+option(ENABLE_FRONTEND_API "Use obs-frontend-api for UI functionality" OFF)
+option(ENABLE_QT "Use Qt functionality" OFF)
+
+include(compilerconfig)
+include(defaults)
+include(helpers)
+
+add_library(${CMAKE_PROJECT_NAME} MODULE)
+
 find_package(libobs REQUIRED)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 
-add_library(obs-pdf-presenter MODULE src/obs-pdf-presenter.cpp)
-target_link_libraries(obs-pdf-presenter PRIVATE OBS::libobs)
-
-target_compile_definitions(obs-pdf-presenter PRIVATE
-  UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
-)
-
-set_target_properties(obs-pdf-presenter PROPERTIES
-  PREFIX ""
-  OUTPUT_NAME "obs-pdf-presenter"
-)
-
-if(WIN32)
-  set(PLUGIN_BIN_DIR "bin/64bit")
-else()
-  set(PLUGIN_BIN_DIR "bin")
+if(ENABLE_FRONTEND_API)
+  find_package(obs-frontend-api REQUIRED)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
 endif()
 
-install(TARGETS obs-pdf-presenter RUNTIME DESTINATION "${PLUGIN_BIN_DIR}")
-install(DIRECTORY data/locale DESTINATION "data")
+if(ENABLE_QT)
+  find_package(Qt6 COMPONENTS Widgets Core)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt6::Core Qt6::Widgets)
+  target_compile_options(
+    ${CMAKE_PROJECT_NAME}
+    PRIVATE $<$<C_COMPILER_ID:Clang,AppleClang>:-Wno-quoted-include-in-framework-header -Wno-comma>
+  )
+  set_target_properties(
+    ${CMAKE_PROJECT_NAME}
+    PROPERTIES AUTOMOC ON AUTOUIC ON AUTORCC ON
+  )
+endif()
+
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/obs-pdf-presenter.cpp)
+
+set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+
+# PPT → PDF 转换脚本随插件一起装到 bin/64bit（运行时与 pdfium.dll 同目录定位）
+install(FILES res/ppt2pdf.ps1 DESTINATION "${CMAKE_PROJECT_NAME}/bin/64bit")

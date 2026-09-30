@@ -1,9 +1,12 @@
 # 构建产物
 build/
 build_x64/
+build_macos/
+build_x86_64/
 deps/
 release/
 install/
+.deps/
 
 # 系统
 *.user
