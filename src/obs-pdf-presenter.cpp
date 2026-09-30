@@ -225,6 +225,7 @@ struct pdf_source {
 
 	gs_texture_t *tex = nullptr;
 	std::vector<uint8_t> canvas; // 1920x1080 BGRA
+	bool canvasDirty = false;    // 画布已更新，等待渲染线程上传纹理
 
 	bool autoplay = false;
 	int interval = 5;
@@ -301,13 +302,8 @@ static void render_page(struct pdf_source *s, int page)
 	pFPDFBitmap_Destroy(bmp);
 	pFPDF_ClosePage(pg);
 
-	/* 上传纹理（尺寸固定 1920x1080） */
-	if (!s->tex) {
-		s->tex = gs_texture_create(CANVAS_W, CANVAS_H, GS_BGRA, 1, nullptr,
-					   GS_DYNAMIC);
-	}
-	if (s->tex)
-		gs_texture_set_image(s->tex, s->canvas.data(), CANVAS_W * 4, false);
+	/* 只更新 CPU 画布，纹理在 video_render（渲染线程）里上传 */
+	s->canvasDirty = true;
 
 	blog(LOG_INFO, "[pdf-presenter] 已渲染第 %d/%d 页 (%.1fx%.1f -> %dx%d)", page,
 	     s->pageCount, pw, ph, dw, dh);
@@ -437,6 +433,16 @@ static void video_render(void *data, gs_effect_t *effect_unused)
 {
 	UNUSED_PARAMETER(effect_unused);
 	struct pdf_source *s = (struct pdf_source *)data;
+
+	/* 纹理创建/上传必须在渲染线程内进行 */
+	if (!s->tex && !s->canvas.empty()) {
+		s->tex = gs_texture_create(CANVAS_W, CANVAS_H, GS_BGRA, 1, nullptr,
+					   GS_DYNAMIC);
+	}
+	if (s->tex && s->canvasDirty) {
+		gs_texture_set_image(s->tex, s->canvas.data(), CANVAS_W * 4, false);
+		s->canvasDirty = false;
+	}
 	if (!s->tex)
 		return;
 
