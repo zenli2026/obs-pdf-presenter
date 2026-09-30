@@ -16,13 +16,21 @@
 #include <shellapi.h>
 #include <string>
 #include <vector>
+#include <thread>
 #include <algorithm>
 #include <cstring>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 
 #define PLUGIN_NAME    "obs-pdf-presenter"
 #define PLUGIN_VERSION "1.0.0"
+
+/* 悬浮控制窗消息/控件 ID */
+#define WM_CTRL_REFRESH (WM_USER + 10)
+#define ID_CTRL_PREV 1001
+#define ID_CTRL_NEXT 1002
+#define ID_CTRL_CLOSE 1003
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "zh-CN")
@@ -408,11 +416,6 @@ static bool prev_btn(obs_properties_t *props, obs_property_t *prop, void *data)
 }
 
 /* ============================= 悬浮控制窗 ============================= */
-#define WM_CTRL_REFRESH (WM_USER + 10)
-#define ID_CTRL_PREV 1001
-#define ID_CTRL_NEXT 1002
-#define ID_CTRL_CLOSE 1003
-
 struct advance_job {
 	struct pdf_source *s;
 	int delta;
@@ -427,7 +430,7 @@ static void advance_job_run(void *param)
 static void advance_on_ui(struct pdf_source *s, int delta)
 {
 	struct advance_job *j = new struct advance_job{s, delta};
-	obs_queue_task(OBS_TASK_UI, advance_job_run, j);
+	obs_queue_task(OBS_TASK_UI, advance_job_run, j, false);
 }
 
 static LRESULT CALLBACK ctrl_wndproc(HWND hwnd, UINT msg, WPARAM wParam,
@@ -457,10 +460,14 @@ static LRESULT CALLBACK ctrl_wndproc(HWND hwnd, UINT msg, WPARAM wParam,
 		if (cw) {
 			cw->page = (int)(intptr_t)wParam;
 			cw->total = (int)(intptr_t)lParam;
-			wchar_t buf[64];
-			swprintf(buf, 64, L"%d / %d 页", cw->page, cw->total);
-			if (cw->label)
-				SetWindowTextW(cw->label, buf);
+			if (cw->label) {
+				char tmp[64];
+				snprintf(tmp, sizeof(tmp), "%d / %d ", cw->page,
+					 cw->total);
+				std::wstring ws = utf8_to_wide(tmp);
+				ws += L"\x9875"; // 页
+				SetWindowTextW(cw->label, ws.c_str());
+			}
 		}
 		return 0;
 	case WM_DESTROY:
@@ -485,7 +492,7 @@ static void ctrl_window_run(struct pdf_source *s)
 	wc.lpszClassName = cls;
 	RegisterClassExW(&wc);
 
-	std::wstring title = L"演示文稿控制 - ";
+	std::wstring title = utf8_to_wide("演示文稿控制 - ");
 	const char *nm = obs_source_get_name(s->source);
 	title += utf8_to_wide(nm ? nm : "");
 
@@ -500,20 +507,20 @@ static void ctrl_window_run(struct pdf_source *s)
 
 	HFONT font = CreateFontW(-16, 0, 0, 0, FW_BOLD, 0, 0, 0,
 				 DEFAULT_CHARSET, 0, 0, 0, 0, L"Microsoft YaHei UI");
-	HWND prev = CreateWindowExW(0, L"BUTTON", L"◀",
+	HWND prev = CreateWindowExW(0, L"BUTTON", L"<",
 				    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 2, 2,
 				    44, 32, hwnd, (HMENU)ID_CTRL_PREV, inst,
 				    nullptr);
-	HWND label = CreateWindowExW(0, L"STATIC", L"0 / 0 页",
+	HWND label = CreateWindowExW(0, L"STATIC", L"0 / 0",
 				     WS_CHILD | WS_VISIBLE | SS_CENTER |
 					     SS_CENTERIMAGE,
 				     48, 2, 88, 32, hwnd, nullptr, inst,
 				     nullptr);
-	HWND next = CreateWindowExW(0, L"BUTTON", L"▶",
+	HWND next = CreateWindowExW(0, L"BUTTON", L">",
 				    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 138,
 				    2, 44, 32, hwnd, (HMENU)ID_CTRL_NEXT, inst,
 				    nullptr);
-	HWND close = CreateWindowExW(0, L"BUTTON", L"✕",
+	HWND close = CreateWindowExW(0, L"BUTTON", L"x",
 				     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 184,
 				     2, 28, 32, hwnd, (HMENU)ID_CTRL_CLOSE,
 				     inst, nullptr);
