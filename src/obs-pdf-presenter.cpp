@@ -46,6 +46,7 @@ static void (*pFPDF_ClosePage)(FPDF_PAGE);
 static void (*pFPDF_CloseDocument)(FPDF_DOCUMENT);
 static float (*pFPDF_GetPageWidth)(FPDF_PAGE);
 static float (*pFPDF_GetPageHeight)(FPDF_PAGE);
+static int (*pFPDF_GetPageSizeByIndex)(FPDF_DOCUMENT, int, double *, double *);
 static FPDF_BITMAP (*pFPDFBitmap_Create)(int, int, int);
 static void (*pFPDFBitmap_FillRect)(FPDF_BITMAP, int, int, int, int, FPDF_DWORD);
 static void *(*pFPDFBitmap_GetBuffer)(FPDF_BITMAP);
@@ -59,6 +60,7 @@ static bool pdfium_ok()
 	return g_pdfium && pFPDF_InitLibrary && pFPDF_LoadDocument &&
 	       pFPDF_GetPageCount && pFPDF_LoadPage && pFPDF_ClosePage &&
 	       pFPDF_CloseDocument && pFPDF_GetPageWidth && pFPDF_GetPageHeight &&
+	       pFPDF_GetPageSizeByIndex &&
 	       pFPDFBitmap_Create && pFPDFBitmap_FillRect && pFPDFBitmap_GetBuffer &&
 	       pFPDFBitmap_Destroy && pFPDF_RenderPageBitmap;
 }
@@ -107,6 +109,7 @@ static void load_pdfium()
 	LOAD_PFN("FPDF_CloseDocument", pFPDF_CloseDocument);
 	LOAD_PFN("FPDF_GetPageWidth", pFPDF_GetPageWidth);
 	LOAD_PFN("FPDF_GetPageHeight", pFPDF_GetPageHeight);
+	LOAD_PFN("FPDF_GetPageSizeByIndex", pFPDF_GetPageSizeByIndex);
 	LOAD_PFN("FPDFBitmap_Create", pFPDFBitmap_Create);
 	LOAD_PFN("FPDFBitmap_FillRect", pFPDFBitmap_FillRect);
 	LOAD_PFN("FPDFBitmap_GetBuffer", pFPDFBitmap_GetBuffer);
@@ -238,19 +241,27 @@ static void render_page(struct pdf_source *s, int page)
 {
 	if (!s->doc || page < 1 || page > s->pageCount)
 		return;
-	FPDF_PAGE pg = pFPDF_LoadPage(s->doc, page - 1);
-	if (!pg)
-		return;
 
-	float pw = pFPDF_GetPageWidth(pg);
-	float ph = pFPDF_GetPageHeight(pg);
+	/* 用 GetPageSizeByIndex 取页面尺寸（double 出参，稳定可靠） */
+	double pw = 0, ph = 0;
+	if (!pFPDF_GetPageSizeByIndex(s->doc, page - 1, &pw, &ph)) {
+		blog(LOG_WARNING, "[pdf-presenter] GetPageSizeByIndex 失败 (page %d)", page);
+		return;
+	}
 	if (pw <= 0 || ph <= 0) {
-		pFPDF_ClosePage(pg);
+		blog(LOG_WARNING, "[pdf-presenter] 页面尺寸无效 (page %d): %.1fx%.1f", page,
+		     pw, ph);
+		return;
+	}
+
+	FPDF_PAGE pg = pFPDF_LoadPage(s->doc, page - 1);
+	if (!pg) {
+		blog(LOG_WARNING, "[pdf-presenter] LoadPage 失败 (page %d)", page);
 		return;
 	}
 
 	/* 按 16:9 画布等比缩放，白边填充 */
-	float fit = std::min((float)CANVAS_W / pw, (float)CANVAS_H / ph);
+	float fit = std::min((float)CANVAS_W / (float)pw, (float)CANVAS_H / (float)ph);
 	int dw = (int)std::lround(pw * fit);
 	int dh = (int)std::lround(ph * fit);
 	if (dw < 1)
@@ -259,9 +270,20 @@ static void render_page(struct pdf_source *s, int page)
 		dh = 1;
 
 	FPDF_BITMAP bmp = pFPDFBitmap_Create(dw, dh, 1);
+	if (!bmp) {
+		blog(LOG_WARNING, "[pdf-presenter] FPDFBitmap_Create 失败 (%dx%d)", dw, dh);
+		pFPDF_ClosePage(pg);
+		return;
+	}
 	pFPDFBitmap_FillRect(bmp, 0, 0, dw, dh, 0xFFFFFFFF);
 	pFPDF_RenderPageBitmap(bmp, pg, 0, 0, dw, dh, 0, 0);
 	const uint8_t *src = (const uint8_t *)pFPDFBitmap_GetBuffer(bmp);
+	if (!src) {
+		blog(LOG_WARNING, "[pdf-presenter] Bitmap_GetBuffer 失败");
+		pFPDFBitmap_Destroy(bmp);
+		pFPDF_ClosePage(pg);
+		return;
+	}
 
 	/* 画布整体白色 */
 	if (s->canvas.size() != (size_t)CANVAS_W * CANVAS_H * 4)
@@ -286,6 +308,9 @@ static void render_page(struct pdf_source *s, int page)
 	}
 	if (s->tex)
 		gs_texture_set_image(s->tex, s->canvas.data(), CANVAS_W * 4, false);
+
+	blog(LOG_INFO, "[pdf-presenter] 已渲染第 %d/%d 页 (%.1fx%.1f -> %dx%d)", page,
+	     s->pageCount, pw, ph, dw, dh);
 }
 
 static void load_document(struct pdf_source *s)
