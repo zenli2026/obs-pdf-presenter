@@ -35,12 +35,11 @@ typedef void  *FPDF_DOCUMENT;
 typedef void  *FPDF_PAGE;
 typedef void  *FPDF_BITMAP;
 typedef unsigned int FPDF_DWORD;
-typedef const wchar_t *FPCWSTR;
 typedef const char   *FPC_BYTESTRING;
 
 static HMODULE g_pdfium = nullptr;
 static void (*pFPDF_InitLibrary)(void);
-static FPDF_DOCUMENT (*pFPDF_LoadDocument)(FPCWSTR, FPC_BYTESTRING);
+static FPDF_DOCUMENT (*pFPDF_LoadDocument)(FPC_BYTESTRING, FPC_BYTESTRING);
 static int (*pFPDF_GetPageCount)(FPDF_DOCUMENT);
 static FPDF_PAGE (*pFPDF_LoadPage)(FPDF_DOCUMENT, int);
 static void (*pFPDF_ClosePage)(FPDF_PAGE);
@@ -136,6 +135,15 @@ static std::string get_ext(const std::string &path)
 	if (p == std::string::npos)
 		return "";
 	return lowercase(path.substr(p + 1));
+}
+
+/* 把路径里的 '/' 统一成 '\\'，避免 PowerShell / PowerPoint 无法解析 */
+static std::string normalize_path(std::string s)
+{
+	for (auto &c : s)
+		if (c == '/')
+			c = '\\';
+	return s;
 }
 
 /* 用本机 PowerPoint(COM) 把 PPT/PPTX 转成 PDF，返回生成的 pdf 路径；失败返回空 */
@@ -301,7 +309,7 @@ static void load_document(struct pdf_source *s)
 			return;
 	}
 	s->pdfPath = path;
-	s->doc = pFPDF_LoadDocument(utf8_to_wide(path).c_str(), nullptr);
+	s->doc = pFPDF_LoadDocument(path.c_str(), nullptr);
 	if (!s->doc) {
 		blog(LOG_WARNING, "[pdf-presenter] 无法打开文档: %s", path.c_str());
 		return;
@@ -379,7 +387,7 @@ static void update(void *data, obs_data_t *settings)
 		s->interval = 1;
 
 	const char *f = obs_data_get_string(settings, "file");
-	std::string nf = f ? f : "";
+	std::string nf = f ? normalize_path(f) : "";
 	if (nf != s->srcFile) {
 		s->srcFile = nf;
 		load_document(s);
@@ -516,6 +524,7 @@ bool obs_module_load(void)
 		std::string b = bin;
 		size_t p = b.find_last_of("/\\");
 		g_module_dir = (p == std::string::npos) ? b : b.substr(0, p);
+		g_module_dir = normalize_path(g_module_dir);
 	}
 
 	load_pdfium();
