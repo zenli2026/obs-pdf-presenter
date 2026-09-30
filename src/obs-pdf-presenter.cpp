@@ -224,8 +224,10 @@ struct pdf_source {
 	int curPage = 0;
 
 	gs_texture_t *tex = nullptr;
-	std::vector<uint8_t> canvas; // 1920x1080 BGRA
-	bool canvasDirty = false;    // 画布已更新，等待渲染线程上传纹理
+	int texW = 0, texH = 0;              // 纹理当前尺寸（渲染线程管理）
+	int canvasW = CANVAS_W, canvasH = CANVAS_H; // 画布实际尺寸（随 PDF 页面比例）
+	std::vector<uint8_t> canvas;         // canvasW x canvasH BGRA
+	bool canvasDirty = false;            // 画布已更新，等待渲染线程上传纹理
 
 	bool autoplay = false;
 	int interval = 5;
@@ -261,7 +263,7 @@ static void render_page(struct pdf_source *s, int page)
 		return;
 	}
 
-	/* 按 16:9 画布等比缩放，白边填充 */
+	/* 以 1920x1080 为上限等比缩放页面，画布 = 页面实际渲染尺寸 */
 	float fit = std::min((float)CANVAS_W / (float)pw, (float)CANVAS_H / (float)ph);
 	int dw = (int)std::lround(pw * fit);
 	int dh = (int)std::lround(ph * fit);
@@ -286,18 +288,11 @@ static void render_page(struct pdf_source *s, int page)
 		return;
 	}
 
-	/* 画布整体白色 */
-	if (s->canvas.size() != (size_t)CANVAS_W * CANVAS_H * 4)
-		s->canvas.assign((size_t)CANVAS_W * CANVAS_H * 4, 0xFF);
-	else
-		std::fill(s->canvas.begin(), s->canvas.end(), 0xFF);
-
-	int ox = (CANVAS_W - dw) / 2;
-	int oy = (CANVAS_H - dh) / 2;
-	for (int y = 0; y < dh; y++) {
-		memcpy(s->canvas.data() + ((size_t)(oy + y) * CANVAS_W + ox) * 4,
-		       src + (size_t)y * dw * 4, (size_t)dw * 4);
-	}
+	/* 画布 = 页面渲染尺寸（BGRA），直接拷贝，不强制 1920x1080 */
+	s->canvas.resize((size_t)dw * dh * 4);
+	memcpy(s->canvas.data(), src, (size_t)dw * dh * 4);
+	s->canvasW = dw;
+	s->canvasH = dh;
 
 	pFPDFBitmap_Destroy(bmp);
 	pFPDF_ClosePage(pg);
@@ -433,14 +428,22 @@ static void video_render(void *data, gs_effect_t *effect_unused)
 {
 	UNUSED_PARAMETER(effect_unused);
 	struct pdf_source *s = (struct pdf_source *)data;
+	if (s->canvas.empty())
+		return;
 
-	/* 纹理创建/上传必须在渲染线程内进行 */
-	if (!s->tex && !s->canvas.empty()) {
-		s->tex = gs_texture_create(CANVAS_W, CANVAS_H, GS_BGRA, 1, nullptr,
+	/* 纹理创建/上传必须在渲染线程内进行，画布尺寸变化时重建纹理 */
+	if (!s->tex || s->texW != s->canvasW || s->texH != s->canvasH) {
+		if (s->tex) {
+			gs_texture_destroy(s->tex);
+			s->tex = nullptr;
+		}
+		s->tex = gs_texture_create(s->canvasW, s->canvasH, GS_BGRA, 1, nullptr,
 					   GS_DYNAMIC);
+		s->texW = s->canvasW;
+		s->texH = s->canvasH;
 	}
 	if (s->tex && s->canvasDirty) {
-		gs_texture_set_image(s->tex, s->canvas.data(), CANVAS_W * 4, false);
+		gs_texture_set_image(s->tex, s->canvas.data(), s->canvasW * 4, false);
 		s->canvasDirty = false;
 	}
 	if (!s->tex)
@@ -452,26 +455,8 @@ static void video_render(void *data, gs_effect_t *effect_unused)
 	gs_technique_begin_pass(tech, 0);
 	gs_effect_set_texture(gs_effect_get_param_by_name(effect, "image"), s->tex);
 
-	uint32_t ow = obs_source_get_width(s->source);
-	uint32_t oh = obs_source_get_height(s->source);
-	float aspect = (float)CANVAS_W / (float)CANVAS_H;
-	float tw, th;
-	if ((float)ow / (float)oh > aspect) {
-		tw = (float)ow;
-		th = tw / aspect;
-	} else {
-		th = (float)oh;
-		tw = th * aspect;
-	}
-	float sx = tw / (float)CANVAS_W;
-	float sy = th / (float)CANVAS_H;
-
-	gs_matrix_push();
-	gs_matrix_identity();
-	gs_matrix_translate3f(((float)ow - tw) / 2.0f, ((float)oh - th) / 2.0f, 0);
-	gs_matrix_scale3f(sx, sy, 1.0f);
+	/* 直接按当前矩阵绘制（含 OBS 的位置/缩放/旋转变换），不重置矩阵 */
 	gs_draw_sprite(s->tex, 0, 0, 0);
-	gs_matrix_pop();
 
 	gs_technique_end_pass(tech);
 	gs_technique_end(tech);
@@ -479,14 +464,14 @@ static void video_render(void *data, gs_effect_t *effect_unused)
 
 static uint32_t get_width(void *data)
 {
-	UNUSED_PARAMETER(data);
-	return CANVAS_W;
+	struct pdf_source *s = (struct pdf_source *)data;
+	return s->canvasW;
 }
 
 static uint32_t get_height(void *data)
 {
-	UNUSED_PARAMETER(data);
-	return CANVAS_H;
+	struct pdf_source *s = (struct pdf_source *)data;
+	return s->canvasH;
 }
 
 static obs_properties_t *get_properties(void *data)
