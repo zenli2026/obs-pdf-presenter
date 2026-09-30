@@ -1,0 +1,71 @@
+name: build
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 获取 obs-deps 预编译依赖
+        shell: pwsh
+        run: |
+          $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/obsproject/obs-deps/releases/latest" `
+            -Headers @{ "User-Agent" = "obs-pdf-presenter-ci" }
+          $asset = $rel.assets | Where-Object { $_.name -match 'obs-deps-windows-x64.*\.zip' } | Select-Object -First 1
+          if (-not $asset) { throw "未找到 obs-deps windows 资产" }
+          curl.exe -L --fail -sS -o deps.zip $asset.browser_download_url
+          Expand-Archive deps.zip -DestinationPath deps -Force
+          Write-Output ("obs-deps: " + (Get-ChildItem deps | Measure-Object).Count + " 项")
+
+      - name: 克隆并编译 obs-studio 的 libobs（提供 OBS SDK）
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch 31.1.1 https://github.com/obsproject/obs-studio.git
+          cmake -S obs-studio -B obs-studio/build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_PREFIX_PATH="$PWD\deps" `
+            -DENABLE_UI=OFF -DENABLE_SCRIPTING=OFF -DENABLE_PLUGINS=OFF `
+            -DENABLE_AJA=OFF -DENABLE_NVENC=OFF -DENABLE_VST=OFF `
+            -DENABLE_WEBRTC=OFF -DENABLE_FREETYPE=OFF -DENABLE_JACK=OFF -DENABLE_PULSEAUDIO=OFF
+          if ($LASTEXITCODE -ne 0) { throw "obs-studio CMake 配置失败" }
+          cmake --build obs-studio/build --target obs --config RelWithDebInfo --parallel
+          if ($LASTEXITCODE -ne 0) { throw "libobs 编译失败" }
+
+      - name: 配置并编译插件
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -Dlibobs_DIR="$PWD\obs-studio\build\libobs"
+          if ($LASTEXITCODE -ne 0) { throw "插件 CMake 配置失败" }
+          cmake --build build --config RelWithDebInfo --parallel
+          if ($LASTEXITCODE -ne 0) { throw "插件编译失败" }
+
+      - name: 下载 pdfium.dll（PDF 渲染引擎）
+        shell: pwsh
+        run: |
+          curl.exe -L --fail -sS -o pdfium.tgz `
+            https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-win-x64.tgz
+          if ($LASTEXITCODE -ne 0) { throw "pdfium 下载失败" }
+          tar -xzf pdfium.tgz -C .
+
+      - name: 组装插件包
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem build -Recurse -Filter 'obs-pdf-presenter.dll' | Select-Object -First 1
+          if (-not $dll) { throw "未找到 obs-pdf-presenter.dll" }
+          New-Item -ItemType Directory -Force -Path out/bin/64bit, out/data/locale | Out-Null
+          Copy-Item $dll.FullName out/bin/64bit
+          Copy-Item (Get-ChildItem -Recurse -Filter pdfium.dll | Select-Object -First 1).FullName out/bin/64bit
+          Copy-Item res/ppt2pdf.ps1 out/bin/64bit
+          Copy-Item data/locale/*.json out/data/locale/
+          Write-Output "已组装:"
+          Get-ChildItem out -Recurse -File | ForEach-Object { $_.FullName }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: obs-pdf-presenter-windows-x64
+          path: out/

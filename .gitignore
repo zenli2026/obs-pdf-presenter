@@ -1,0 +1,12 @@
+# 构建产物
+build/
+build_x64/
+deps/
+release/
+install/
+
+# 系统
+*.user
+*.suo
+.DS_Store
+Thumbs.db
