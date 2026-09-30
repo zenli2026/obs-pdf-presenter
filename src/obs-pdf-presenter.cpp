@@ -53,6 +53,7 @@ static void *(*pFPDFBitmap_GetBuffer)(FPDF_BITMAP);
 static void (*pFPDFBitmap_Destroy)(FPDF_BITMAP);
 static void (*pFPDF_RenderPageBitmap)(FPDF_BITMAP, FPDF_PAGE, int, int, int,
 				      int, int, int);
+static void (*pFPDF_DestroyLibrary)(void);
 
 static bool pdfium_ok()
 {
@@ -112,6 +113,7 @@ static void load_pdfium()
 	LOAD_PFN("FPDFBitmap_GetBuffer", pFPDFBitmap_GetBuffer);
 	LOAD_PFN("FPDFBitmap_Destroy", pFPDFBitmap_Destroy);
 	LOAD_PFN("FPDF_RenderPageBitmap", pFPDF_RenderPageBitmap);
+	LOAD_PFN("FPDF_DestroyLibrary", pFPDF_DestroyLibrary);
 #undef LOAD_PFN
 	if (pdfium_ok())
 		pFPDF_InitLibrary();
@@ -215,7 +217,7 @@ struct pdf_source {
 
 	bool autoplay = false;
 	int interval = 5;
-	int tick = 0;
+	float acc = 0;   // 自动播放计时（秒）
 };
 
 static const char *get_name(void *unused)
@@ -318,16 +320,18 @@ static void advance(struct pdf_source *s, int delta)
 	if (s->pageCount > 0 && page > s->pageCount)
 		page = s->pageCount;
 	obs_data_set_int(s->settings, "page", page);
-	obs_source_update(s->source);
+	obs_source_update(s->source, s->settings);
 }
 
-static void autoplay_cb(void *param)
+/* 自动播放：libobs 每帧回调（不用依赖前端 API 的 obs_timer_*） */
+static void video_tick(void *data, float seconds)
 {
-	struct pdf_source *s = (struct pdf_source *)param;
+	struct pdf_source *s = (struct pdf_source *)data;
 	if (!s->autoplay || s->pageCount <= 0)
 		return;
-	if (++s->tick >= s->interval) {
-		s->tick = 0;
+	s->acc += seconds;
+	if (s->acc >= (float)s->interval) {
+		s->acc = 0;
 		advance(s, 1);
 	}
 }
@@ -380,7 +384,7 @@ static void update(void *data, obs_data_t *settings)
 		s->srcFile = nf;
 		load_document(s);
 		s->curPage = 0;
-		s->tick = 0;
+		s->acc = 0;
 	}
 
 	if (!s->srcFile.empty() && s->doc) {
@@ -396,9 +400,9 @@ static void update(void *data, obs_data_t *settings)
 	}
 }
 
-static void video_render(void *data, gs_texture_t *unused)
+static void video_render(void *data, gs_effect_t *effect_unused)
 {
-	UNUSED_PARAMETER(unused);
+	UNUSED_PARAMETER(effect_unused);
 	struct pdf_source *s = (struct pdf_source *)data;
 	if (!s->tex)
 		return;
@@ -474,15 +478,15 @@ static void *create(obs_data_t *settings, obs_source_t *source)
 {
 	struct pdf_source *s = new struct pdf_source();
 	s->source = source;
-	s->settings = obs_data_copy(settings);
+	s->settings = settings;
+	obs_data_addref(s->settings);
 
-	obs_source_update(s->source);
+	obs_source_update(s->source, s->settings);
 
 	obs_hotkey_register_source(source, "obs-pdf-presenter.next",
 				   obs_module_text("Hotkey.Next"), hotkey_next, s);
 	obs_hotkey_register_source(source, "obs-pdf-presenter.prev",
 				   obs_module_text("Hotkey.Prev"), hotkey_prev, s);
-	obs_timer_add(autoplay_cb, s);
 	return s;
 }
 
@@ -491,7 +495,6 @@ static void destroy(void *data)
 	struct pdf_source *s = (struct pdf_source *)data;
 	if (!s)
 		return;
-	obs_timer_remove(autoplay_cb, s);
 	if (s->doc)
 		pFPDF_CloseDocument(s->doc);
 	if (s->tex)
@@ -529,6 +532,7 @@ bool obs_module_load(void)
 	source_info.get_properties = get_properties;
 	source_info.update = update;
 	source_info.video_render = video_render;
+	source_info.video_tick = video_tick;
 
 	obs_register_source(&source_info);
 	registered = true;

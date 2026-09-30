@@ -16,6 +16,9 @@ add_library(${CMAKE_PROJECT_NAME} MODULE)
 find_package(libobs REQUIRED)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 
+# windows.h 的 min/max 宏会破坏 std::min/std::max，需禁用
+target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE NOMINMAX)
+
 if(ENABLE_FRONTEND_API)
   find_package(obs-frontend-api REQUIRED)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
