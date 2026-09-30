@@ -35,12 +35,16 @@ static std::wstring utf8_to_wide(const char *s)
 
 struct scene_tile {
 	obs_source_t *scene = nullptr;
-	gs_texture_t *tex = nullptr;
+	obs_view_t *view = nullptr;      /* 该场景专属视图（激活子源以便渲染） */
+	gs_texrender_t *trBase = nullptr; /* 原生画幅纹理渲染器 */
+	uint32_t sceneW = 0;              /* 场景原始画幅宽 */
+	uint32_t sceneH = 0;              /* 场景原始画幅高 */
+	gs_texture_t *texThumb = nullptr; /* 缩略图纹理（GPU 下采样目标） */
 	gs_stagesurf_t *stage = nullptr;
-	unsigned char *buf = nullptr; // texW*texH*4 RGBA 缓冲
+	unsigned char *buf = nullptr; /* texW*texH*4 RGBA 缓冲 */
 	int texW = 0;
 	int texH = 0;
-	bool ready = false; // buf 已有本次渲染结果
+	bool ready = false; /* buf 已有本次渲染结果 */
 	HWND hwnd = nullptr;
 };
 
@@ -67,6 +71,7 @@ struct multiview_ctx {
 	std::mutex mtx;
 	std::vector<scene_tile> tiles;
 	obs_source_t *selected = nullptr;
+	obs_source_t *currentScene = nullptr; /* 当前输出场景（红框） */
 	int selectedIndex = -1;
 	int cols = 4;
 	int scrollPos = 0;
@@ -79,34 +84,50 @@ struct multiview_ctx {
 
 static multiview_ctx *g_ctx = nullptr;
 
-/* 在一个场景的纹理上渲染它（必须在 graphics 线程调用） */
+/* 在一个场景上渲染并下采样为缩略图（必须在 graphics 线程调用） */
 static void render_one_tile(scene_tile &t)
 {
-	if (!t.tex || !t.scene)
+	if (!t.view || !t.trBase || !t.texThumb || !t.stage)
 		return;
-	gs_set_render_target(t.tex, nullptr);
+	/* 1) 在原生画幅纹理上渲染场景（obs_view 已激活子源） */
+	if (gs_texrender_begin(t.trBase, t.sceneW, t.sceneH)) {
+		obs_view_render(t.view);
+		gs_texrender_end(t.trBase);
+	}
+	gs_texture_t *full = gs_texrender_get_texture(t.trBase);
+	if (!full)
+		return;
+
+	/* 2) GPU 下采样到缩略图纹理 */
+	gs_set_render_target(t.texThumb, nullptr);
 	gs_viewport_push();
 	gs_set_viewport(0, 0, t.texW, t.texH);
 	gs_ortho(0.0f, (float)t.texW, 0.0f, (float)t.texH, -100.0f, 100.0f);
-	obs_source_video_render(t.scene);
+	gs_effect_t *eff = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+	gs_technique_t *tech = gs_effect_get_technique(eff, "Draw");
+	gs_effect_set_texture(gs_effect_get_param_by_name(eff, "image"), full);
+	gs_technique_begin(tech);
+	gs_technique_begin_pass(tech, 0);
+	gs_draw_sprite(full, 0, (uint32_t)t.texW, (uint32_t)t.texH);
+	gs_technique_end_pass(tech);
+	gs_technique_end(tech);
 	gs_viewport_pop();
 	gs_set_render_target(nullptr, nullptr);
 	gs_flush();
 
-	if (t.stage) {
-		gs_stage_texture(t.stage, t.tex);
-		unsigned char *ptr = nullptr;
-		uint32_t linesize = 0;
-		if (gs_stagesurface_map(t.stage, &ptr, &linesize)) {
-			unsigned char *dst = t.buf;
-			for (int y = 0; y < t.texH; y++) {
-				memcpy(dst, ptr + (size_t)y * linesize,
-				       (size_t)t.texW * 4);
-				dst += (size_t)t.texW * 4;
-			}
-			gs_stagesurface_unmap(t.stage);
-			t.ready = true;
+	/* 3) 读回缩略图像素 */
+	gs_stage_texture(t.stage, t.texThumb);
+	unsigned char *ptr = nullptr;
+	uint32_t linesize = 0;
+	if (gs_stagesurface_map(t.stage, &ptr, &linesize)) {
+		unsigned char *dst = t.buf;
+		for (int y = 0; y < t.texH; y++) {
+			memcpy(dst, ptr + (size_t)y * linesize,
+			       (size_t)t.texW * 4);
+			dst += (size_t)t.texW * 4;
 		}
+		gs_stagesurface_unmap(t.stage);
+		t.ready = true;
 	}
 }
 
@@ -125,12 +146,20 @@ static void setup_textures_task(void *param)
 	multiview_ctx *ctx = (multiview_ctx *)param;
 	std::lock_guard<std::mutex> lk(ctx->mtx);
 	for (auto &t : ctx->tiles) {
-		if (t.tex)
-			continue;
-		t.tex = gs_texture_create((uint32_t)t.texW, (uint32_t)t.texH,
-					 GS_RGBA, 1, nullptr, GS_RENDER_TARGET);
-		t.stage = gs_stagesurface_create((uint32_t)t.texW, (uint32_t)t.texH,
-						 GS_RGBA);
+		if (!t.trBase) {
+			if (t.sceneW == 0 || t.sceneH == 0) {
+				t.sceneW = 1920;
+				t.sceneH = 1080;
+			}
+			t.trBase = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+		}
+		if (!t.texThumb)
+			t.texThumb = gs_texture_create((uint32_t)t.texW,
+						       (uint32_t)t.texH, GS_RGBA, 1,
+						       nullptr, GS_RENDER_TARGET);
+		if (!t.stage)
+			t.stage = gs_stagesurface_create((uint32_t)t.texW,
+							  (uint32_t)t.texH, GS_RGBA);
 	}
 }
 
@@ -140,8 +169,12 @@ static void release_tiles_task(void *param)
 	multiview_ctx *ctx = (multiview_ctx *)param;
 	std::lock_guard<std::mutex> lk(ctx->mtx);
 	for (auto &t : ctx->tiles) {
-		if (t.tex)
-			gs_texture_destroy(t.tex);
+		if (t.view)
+			obs_view_destroy(t.view);
+		if (t.trBase)
+			gs_texrender_destroy(t.trBase);
+		if (t.texThumb)
+			gs_texture_destroy(t.texThumb);
 		if (t.stage)
 			gs_stagesurface_destroy(t.stage);
 		if (t.buf)
@@ -150,6 +183,7 @@ static void release_tiles_task(void *param)
 			obs_source_release(t.scene);
 	}
 	ctx->tiles.clear();
+	ctx->currentScene = nullptr;
 }
 
 /* ---------------------- GDI 绘制 ---------------------- */
@@ -200,11 +234,28 @@ static void tile_paint(multiview_ctx *ctx, HWND hwnd, int index)
 		SelectObject(hdc, of);
 	}
 
-	/* 选中描边 */
-	if (index == ctx->selectedIndex) {
-		HBRUSH sel = CreateSolidBrush(RGB(38, 160, 218));
-		FrameRect(hdc, &rc, sel);
-		DeleteObject(sel);
+	/* 边框：当前输出=红，选中=蓝（当前优先） */
+	bool isCurrent = (ctx->currentScene == t.scene);
+	bool isSelected = (index == ctx->selectedIndex);
+	if (isCurrent || isSelected) {
+		HGDIOBJ oldP = nullptr, oldB = nullptr;
+		HPEN pen;
+		if (isCurrent)
+			pen = CreatePen(PS_SOLID, 3, RGB(232, 28, 28)); /* 红 */
+		else
+			pen = CreatePen(PS_SOLID, 2, RGB(38, 160, 218)); /* 蓝 */
+		HBRUSH nul = (HBRUSH)GetStockObject(NULL_BRUSH);
+		oldP = SelectObject(hdc, pen);
+		oldB = SelectObject(hdc, nul);
+		RECT fr = rc;
+		fr.left += 1;
+		fr.top += 1;
+		fr.right -= 1;
+		fr.bottom -= 1;
+		Rectangle(hdc, fr.left, fr.top, fr.right, fr.bottom);
+		SelectObject(hdc, oldP);
+		SelectObject(hdc, oldB);
+		DeleteObject(pen);
 	}
 	EndPaint(hwnd, &ps);
 }
@@ -233,6 +284,7 @@ static void switch_to_tile(multiview_ctx *ctx, HWND hwnd)
 	ctx->selected = ctx->tiles[index].scene;
 	ctx->selectedIndex = index;
 	obs_frontend_set_current_scene(ctx->selected);
+	ctx->currentScene = ctx->selected;
 	SetWindowTextW(ctx->statusLabel,
 		       (L"已切换到：" +
 			utf8_to_wide(obs_source_get_name(ctx->selected)))
@@ -343,9 +395,16 @@ static void rebuild_grid(multiview_ctx *ctx)
 	HINSTANCE inst = (HINSTANCE)GetModuleHandleW(nullptr);
 	for (size_t i = 0; i < n; i++) {
 		scene_tile &t = ctx->tiles[i];
-		t.scene = obs_source_get_ref(list.sources.array[i]);
-		uint32_t sw = obs_source_get_width(list.sources.array[i]);
-		uint32_t sh = obs_source_get_height(list.sources.array[i]);
+		obs_source_t *sc = list.sources.array[i];
+		t.scene = obs_source_get_ref(sc);
+		t.view = obs_view_create();
+		if (t.view)
+			obs_view_set_source(t.view, 0, t.scene); /* 激活子源可渲染 */
+
+		uint32_t sw = obs_source_get_width(sc);
+		uint32_t sh = obs_source_get_height(sc);
+		t.sceneW = sw;
+		t.sceneH = sh;
 		if (sw == 0 || sh == 0) {
 			sw = 320;
 			sh = 180;
@@ -398,6 +457,7 @@ static void on_switch(multiview_ctx *ctx)
 	if (!ctx->selected)
 		return;
 	obs_frontend_set_current_scene(ctx->selected);
+	ctx->currentScene = ctx->selected;
 	SetWindowTextW(ctx->statusLabel,
 		       (L"已切换到：" +
 			utf8_to_wide(obs_source_get_name(ctx->selected)))
@@ -459,6 +519,7 @@ static LRESULT CALLBACK main_wndproc(HWND hwnd, UINT msg, WPARAM wParam,
 	}
 	case WM_TIMER:
 		if (ctx && wParam == TIMER_RENDER) {
+			ctx->currentScene = obs_frontend_get_current_scene();
 			obs_queue_task(OBS_TASK_GRAPHICS, render_all_task, ctx,
 				       false);
 			for (auto &t : ctx->tiles)
