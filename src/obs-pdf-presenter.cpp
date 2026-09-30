@@ -1,8 +1,8 @@
 /*
  * obs-pdf-presenter —— OBS 原生「演示文稿播放器」插件
- * 在 OBS 来源列表直接出现「演示文稿播放器」，可选 PDF / PPT / PPTX，
- * 支持快捷键翻页、跳页、自动播放。PDF 用 PDFium 渲染，PPT 用本机
- * PowerPoint(COM) 转 PDF 后渲染。
+ * 在 OBS 来源列表直接出现「演示文稿播放器」，选择 PDF 文件即可播放，
+ * 支持快捷键翻页、跳页、自动播放。PDF 用 PDFium 渲染。
+ * PPT/PPTX 请先用 PowerPoint 另存为 PDF 后再加载。
  *
  * 本项目按 GNU GPL v2 协议开源。
  */
@@ -14,8 +14,6 @@
 
 #include <windows.h>
 #include <shellapi.h>
-#include <objbase.h>
-#include <oleauto.h>
 #include <string>
 #include <vector>
 #include <thread>
@@ -38,7 +36,7 @@ OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "zh-CN")
 
 /* ============================= 运行时定位的资源 ============================= */
-static std::string g_module_dir;   // 插件 dll 所在目录（放 pdfium.dll、ppt2pdf.ps1）
+static std::string g_module_dir;   // 插件 dll 所在目录（放 pdfium.dll）
 
 /* ============================= PDFium 动态绑定 ============================= */
 typedef void  *FPDF_DOCUMENT;
@@ -159,168 +157,10 @@ static std::string normalize_path(std::string s)
 	return s;
 }
 
-/* 用本机 PowerPoint(COM) 把 PPT/PPTX 转成 PDF，返回生成的 pdf 路径；失败返回空 */
+/* 文件是否存在 */
 static bool file_exists(const std::wstring &path)
 {
 	return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
-}
-
-/* ---- PowerPoint COM 自动化辅助 ---- */
-static HRESULT get_dispid(IDispatch *p, const wchar_t *name, DISPID *id)
-{
-	if (!p)
-		return E_POINTER;
-	wchar_t *names[1] = {(wchar_t *)name};
-	DISPID d = 0;
-	HRESULT hr = p->GetIDsOfNames(IID_NULL, names, 1, LOCALE_USER_DEFAULT, &d);
-	if (id)
-		*id = d;
-	return hr;
-}
-
-static HRESULT com_get_prop(IDispatch *p, const wchar_t *name, VARIANT *res)
-{
-	DISPID id;
-	HRESULT hr = get_dispid(p, name, &id);
-	if (FAILED(hr))
-		return hr;
-	DISPPARAMS dp = {};
-	return p->Invoke(id, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_PROPERTYGET, &dp,
-			 res, nullptr, nullptr);
-}
-
-static HRESULT com_call(IDispatch *p, const wchar_t *name, VARIANT *args,
-			int argc, VARIANT *res)
-{
-	DISPID id;
-	HRESULT hr = get_dispid(p, name, &id);
-	if (FAILED(hr))
-		return hr;
-	if (argc > 0) { // Invoke 要求参数倒序
-		for (int i = 0, j = argc - 1; i < j; i++, j--) {
-			VARIANT t = args[i];
-			args[i] = args[j];
-			args[j] = t;
-		}
-	}
-	DISPPARAMS dp = {};
-	dp.cArgs = (UINT)argc;
-	dp.rgvarg = args;
-	VARIANT tmp;
-	VariantInit(&tmp);
-	VARIANT *out = res ? res : &tmp;
-	hr = p->Invoke(id, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_METHOD, &dp, out,
-		       nullptr, nullptr);
-	if (!res)
-		VariantClear(&tmp);
-	return hr;
-}
-
-/* 直接用本机 PowerPoint(COM) 把 PPT/PPTX 转成 PDF；返回生成的 pdf 路径；失败返回空 */
-static std::string convert_ppt_to_pdf(const std::string &src)
-{
-	std::wstring srcW = utf8_to_wide(src);
-
-	wchar_t tempDir[MAX_PATH] = {0};
-	if (!GetTempPathW(MAX_PATH, tempDir))
-		return "";
-	std::wstring outDir = std::wstring(tempDir) + L"obs_pdf_presenter\\";
-	CreateDirectoryW(outDir.c_str(), nullptr);
-
-	/* 输出名：源文件名.pdf */
-	std::string base = src;
-	size_t slash = base.find_last_of("/\\");
-	if (slash != std::string::npos)
-		base = base.substr(slash + 1);
-	size_t dot = base.find_last_of('.');
-	if (dot != std::string::npos)
-		base = base.substr(0, dot);
-	std::wstring outW = outDir + utf8_to_wide(base) + L".pdf";
-	if (file_exists(outW))
-		DeleteFileW(outW.c_str());
-
-	bool coInit = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
-	IDispatch *pp = nullptr;
-	bool ok = false;
-	do {
-		CLSID clsid;
-		if (FAILED(CLSIDFromProgID(L"PowerPoint.Application", &clsid)))
-			break;
-		if (FAILED(CoCreateInstance(clsid, nullptr, CLSCTX_LOCAL_SERVER,
-					    IID_IDispatch, (void **)&pp)))
-			break;
-
-		VARIANT vPresents;
-		VariantInit(&vPresents);
-		if (FAILED(com_get_prop(pp, L"Presentations", &vPresents)))
-			break;
-		if (vPresents.vt != VT_DISPATCH || !vPresents.pdispVal) {
-			VariantClear(&vPresents);
-			break;
-		}
-		IDispatch *presents = vPresents.pdispVal;
-
-		/* Presentations.Open(FileName, ReadOnly=true, Untitled=false, WithWindow=true) */
-		VARIANT args[4];
-		for (int i = 0; i < 4; i++)
-			VariantInit(&args[i]);
-		args[0].vt = VT_BSTR;
-		args[0].bstrVal = SysAllocString(srcW.c_str());
-		args[1].vt = VT_BOOL;
-		args[1].boolVal = VARIANT_TRUE;
-		args[2].vt = VT_BOOL;
-		args[2].boolVal = VARIANT_FALSE;
-		args[3].vt = VT_BOOL;
-		args[3].boolVal = VARIANT_TRUE;
-		VARIANT vPres;
-		VariantInit(&vPres);
-		if (FAILED(com_call(presents, L"Open", args, 4, &vPres)) ||
-		    vPres.vt != VT_DISPATCH || !vPres.pdispVal) {
-			VariantClear(&vPresents);
-			break;
-		}
-		VariantClear(&vPresents); // 释放 Presentations 引用
-		IDispatch *pres = vPres.pdispVal;
-
-		/* Presentation.SaveAs(OutputPath, ppSaveAsPDF=32) */
-		VARIANT sa[2];
-		VariantInit(&sa[0]);
-		VariantInit(&sa[1]);
-		sa[0].vt = VT_BSTR;
-		sa[0].bstrVal = SysAllocString(outW.c_str());
-		sa[1].vt = VT_I4;
-		sa[1].lVal = 32;
-		VARIANT saRet;
-		VariantInit(&saRet);
-		ok = SUCCEEDED(com_call(pres, L"SaveAs", sa, 2, &saRet));
-		VariantClear(&saRet);
-		VariantClear(&sa[0]);
-		VariantClear(&sa[1]);
-
-		/* Presentation.Close() */
-		VARIANT cRet;
-		VariantInit(&cRet);
-		com_call(pres, L"Close", nullptr, 0, &cRet);
-		VariantClear(&cRet);
-		pres->Release();
-		VariantClear(&vPres);
-
-		/* PowerPoint.Quit() */
-		VARIANT qRet;
-		VariantInit(&qRet);
-		com_call(pp, L"Quit", nullptr, 0, &qRet);
-		VariantClear(&qRet);
-		pp->Release();
-		pp = nullptr;
-	} while (0);
-
-	if (coInit)
-		CoUninitialize();
-	if (!ok)
-		blog(LOG_WARNING, "[pdf-presenter] PPT 转 PDF 失败 (COM)");
-	if (ok && file_exists(outW))
-		return wide_to_utf8(outW);
-	return "";
 }
 
 /* ============================= 源结构 ============================= */
@@ -455,9 +295,10 @@ static void load_document(struct pdf_source *s)
 	std::string path = s->srcFile;
 	std::string ext = get_ext(path);
 	if (ext == "ppt" || ext == "pptx") {
-		path = convert_ppt_to_pdf(s->srcFile);
-		if (path.empty())
-			return;
+		/* 按用户要求：插件只直接播放 PDF，PPTX 请先转为 PDF 再加载 */
+		blog(LOG_INFO,
+		     "[pdf-presenter] 检测到 PPT/PPTX。本插件只直接播放 PDF，请先用 PowerPoint 将该文件另存为 PDF 再加载。");
+		return;
 	}
 	s->pdfPath = path;
 	s->doc = pFPDF_LoadDocument(path.c_str(), nullptr);
@@ -829,7 +670,7 @@ static obs_properties_t *get_properties(void *data)
 	struct pdf_source *s = (struct pdf_source *)data;
 	obs_properties_t *props = obs_properties_create();
 	obs_properties_add_path(props, "file", obs_module_text("File"),
-				OBS_PATH_FILE, "PDF/PPT (*.pdf *.ppt *.pptx)", nullptr);
+				OBS_PATH_FILE, "PDF (*.pdf)", nullptr);
 	obs_properties_add_int(props, "page", obs_module_text("Page"), 1, 100000, 1);
 	obs_properties_add_button(props, "prev", obs_module_text("Prev"), prev_btn);
 	obs_properties_add_button(props, "next", obs_module_text("Next"), next_btn);
@@ -890,7 +731,7 @@ static bool registered = false;
 
 bool obs_module_load(void)
 {
-	/* 定位插件目录，供 pdfium.dll / ppt2pdf.ps1 使用 */
+	/* 定位插件目录，供 pdfium.dll 使用 */
 	obs_module_t *mod = obs_current_module();
 	const char *bin = mod ? obs_get_module_binary_path(mod) : nullptr;
 	if (bin) {
